@@ -2,7 +2,7 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned
+from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned, MessageEntityTextUrl, MessageEntityUrl
 import asyncio
 import os
 import re
@@ -15,21 +15,18 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V2.5: Persistent Engine & Time Analytics Active!"
+    return "Official IPL Titan Live Join-Tracker V2.5: Persistent Engine & Hidden Entity Analytics Active!"
 
 # ========================================================
-# CONFIGURATION (NEW TARGET ID APPLIED)
+# CONFIGURATION
 # ========================================================
 api_id = 36094172
 api_hash = "ff6eee1bcccf82daea88c63c45b6b546"
 
 SESSION_STRING = os.environ.get("SESSION_STRING", None)
-# Naya Target Channel ID strictly configured
 TARGET_MAIN_CHANNEL = -1002413253133  
-
 FOLDER_TARGET_NAME = "RAN X CROXX"
 
-# Hugging Face Persistent Storage path check (Restart par data safe rahega)
 if os.path.exists("/data"):
     DB_FILE = "/data/devil_analytics.json"
 else:
@@ -42,13 +39,14 @@ else:
 
 CROSS_LOOP_RUNNING = False
 MEMORY_CACHE = {}
+CHANNELS_QUEUE = []  
 
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
 }
 
 # ========================================================
-# ASYNC SAFE STORAGE SYSTEM (ANTI-DATA-LOSS)
+# STORAGE SYSTEM WITH QUEUE PERSISTENCE
 # ========================================================
 def load_analytics():
     global MEMORY_CACHE
@@ -67,7 +65,6 @@ def save_analytics(data):
     global MEMORY_CACHE
     MEMORY_CACHE = data
     try:
-        # Ensures atomic writes so file never gets corrupted
         temp_file = f"{DB_FILE}.tmp"
         with open(temp_file, "w") as f:
             json.dump(data, f, indent=4)
@@ -75,41 +72,34 @@ def save_analytics(data):
     except Exception:
         pass
 
+def save_queue_state(queue_list):
+    db = load_analytics()
+    db["saved_queue_state"] = queue_list
+    save_analytics(db)
+
+def get_saved_queue_state():
+    db = load_analytics()
+    return db.get("saved_queue_state", [])
+
 def update_joins_score(channel_id, channel_title, joins_gained):
     db = load_analytics()
     ch_key = str(channel_id)
-    
-    # Current timestamp for Timing Sense analysis
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    current_hour = datetime.now().strftime("%I:%M %p") # Example: 04:00 PM
+    current_hour = datetime.now().strftime("%I:%M %p")
     
     if ch_key not in db:
-        db[ch_key] = {
-            "title": channel_title,
-            "total_joins": 0,
-            "runs": 0,
-            "time_history": []
-        }
+        db[ch_key] = {"title": channel_title, "total_joins": 0, "runs": 0, "time_history": []}
     
-    # Handle legacy databases gracefully
     if "time_history" not in db[ch_key]:
         db[ch_key]["time_history"] = []
         
     db[ch_key]["runs"] += 1
     db[ch_key]["total_joins"] += max(0, joins_gained)
-    
-    # Save current run analytics with time mapping
     db[ch_key]["time_history"].append({
-        "timestamp": current_time_str,
-        "hour": current_hour,
-        "joins": max(0, joins_gained)
+        "timestamp": current_time_str, "hour": current_hour, "joins": max(0, joins_gained)
     })
-    
     save_analytics(db)
 
-# ========================================================
-# LIVE JOIN REQUESTS COUNTER
-# ========================================================
 async def get_current_join_requests(target_channel):
     try:
         full_channel = await client(GetFullChannelRequest(target_channel))
@@ -120,10 +110,11 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# ADVANCE TELEGRAM-ONLY LINK DETECTOR (ANTI-SKIP SYSTEM)
+# HIGHLY OPTIMIZED DETECTOR (TEXT + BUTTONS + HIDDEN HYPERLINKS)
 # ========================================================
-async def check_and_extract_link(real_entity, channel_username):
+async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
     try:
+        # 1. Pinned Message Check
         try:
             pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=1)
             if pinned_msgs and pinned_msgs[0].message:
@@ -133,38 +124,68 @@ async def check_and_extract_link(real_entity, channel_username):
         except Exception:
             pass
 
+        # 2. Bio / About Check
         full_channel = await client(GetFullChannelRequest(real_entity))
         bio = full_channel.full_chat.about or ""
-        
         if any(word in bio.lower() for word in ["no link", "no cross", "admin remove", "no promo"]):
             return False, None
 
         self_user = channel_username.lower().strip() if channel_username else "____none____"
         tg_link_pattern = r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?[\w\-]+'
 
-        async for msg in client.iter_messages(real_entity, limit=2):
-            if msg.message:
-                found_links = re.findall(tg_link_pattern, msg.message.lower())
-                for raw_link in found_links:
-                    if self_user in raw_link:
-                        continue
-                    if "bot" in raw_link:
-                        continue
-                    return False, None
+        # Helper function block filters checks safely
+        def is_invalid_link(url_str):
+            u_low = url_str.lower()
+            # Apne channels ya bot link ko filter/skip karne ke liye condition
+            if self_user in u_low or "devil_prediction" in u_low or "bot" in u_low or "titan" in u_low:
+                return True
+            return False
 
+        # 3. ADVANCED ENTITY SCANNING (Hidden Text Links Formatting)
+        if msg_obj and msg_obj.entities:
+            for entity in msg_obj.entities:
+                # Text Hyperlinks check: e.g., [Join Here](t.me/link)
+                if isinstance(entity, MessageEntityTextUrl) and entity.url:
+                    if not is_invalid_link(entity.url) and re.search(tg_link_pattern, entity.url.lower()):
+                        return True, entity.url
+                # Raw URL text inside format entities
+                elif isinstance(entity, MessageEntityUrl) and msg_obj.message:
+                    offset = entity.offset
+                    length = entity.length
+                    extracted_url = msg_obj.message[offset:offset+length]
+                    if not is_invalid_link(extracted_url) and re.search(tg_link_pattern, extracted_url.lower()):
+                        return True, extracted_url
+
+        # 4. BUTTON SCANNING SYSTEM
+        if msg_obj and msg_obj.buttons:
+            for row in msg_obj.buttons:
+                for button in row:
+                    if button.url:
+                        if not is_invalid_link(button.url) and re.search(tg_link_pattern, button.url.lower()):
+                            return True, button.url
+
+        # 5. REGULAR TEXT REGEX FALLBACK
+        if msg_obj and msg_obj.message:
+            found_links = re.findall(tg_link_pattern, msg_obj.message)
+            for raw_link in found_links:
+                full_raw_url = f"https://{raw_link}"
+                if not is_invalid_link(full_raw_url):
+                    return True, full_raw_url
+
+        # 6. BIO FALLBACK OR USERNAME LINK
         extracted_links = re.findall(tg_link_pattern, bio)
         if extracted_links:
             return True, f"https://{extracted_links[0]}"
-        else:
-            if channel_username:
-                return True, f"https://t.me/{channel_username}"
-            else:
-                return True, "SKIP_DROP"
+        
+        if channel_username:
+            return True, f"https://t.me/{channel_username}"
+            
+        return True, "SKIP_DROP"
     except Exception:
         return True, "SKIP_DROP"
 
 # ========================================================
-# SAFE FOLDER FILTER
+# FOLDER CHANNELS SYSTEM
 # ========================================================
 async def get_folder_channels_safely(target_name, event):
     channel_ids = []
@@ -176,14 +197,12 @@ async def get_folder_channels_safely(target_name, event):
         for dialog_filter in filters_list:
             if isinstance(dialog_filter, DialogFilter) and dialog_filter.title:
                 folder_title = str(dialog_filter.title.text if hasattr(dialog_filter.title, 'text') else dialog_filter.title).strip()
-                
                 if folder_title.lower() == target_clean:
                     if hasattr(dialog_filter, 'include_peers'):
                         for peer in dialog_filter.include_peers:
                             raw_id = None
                             if hasattr(peer, 'channel_id'): raw_id = peer.channel_id
                             elif isinstance(peer, PeerChannel): raw_id = peer.channel_id
-                            
                             if raw_id:
                                 channel_ids.append(raw_id)
     except Exception:
@@ -191,11 +210,11 @@ async def get_folder_channels_safely(target_name, event):
     return list(set(channel_ids))
 
 # ========================================================
-# CONTROLLER & STATUS DISPLAY WITH TIMING SENSE
+# BOT COMMANDS HANDLER
 # ========================================================
 @client.on(events.NewMessage(chats='me'))
 async def controller(event):
-    global CROSS_LOOP_RUNNING
+    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE
     text = event.raw_text.strip().lower()
     
     if text == "/cross start":
@@ -208,19 +227,42 @@ async def controller(event):
             
         reply_msg = await event.get_reply_message()
         CROSS_LOOP_RUNNING = True
+        
+        saved_q = get_saved_queue_state()
+        if saved_q:
+            CHANNELS_QUEUE = saved_q
+            await event.reply(f"🔄 **Purana state mila!** Wahi se continue kar raha hu jahan se stop hua tha. Remaining: {len(CHANNELS_QUEUE)} channels.")
+        else:
+            channels = await get_folder_channels_safely(FOLDER_TARGET_NAME, event)
+            if not channels:
+                await event.reply(f"❌ Folder '{FOLDER_TARGET_NAME}' khali mila!")
+                CROSS_LOOP_RUNNING = False
+                return
+            random.shuffle(channels)
+            db = load_analytics()
+            channels.sort(key=lambda c: db.get(str(c), {}).get("total_joins", 0), reverse=True)
+            CHANNELS_QUEUE = list(channels)
+            await event.reply(f"🚀 **Live Join-Tracker Engine Enabled.** Processing {len(CHANNELS_QUEUE)} channels...")
+
         asyncio.get_event_loop().create_task(run_cross_loop(reply_msg, event))
         
     elif text == "/cross stop":
         CROSS_LOOP_RUNNING = False
-        await event.reply("🛑 Loop rok diya gaya hai.")
+        save_queue_state(CHANNELS_QUEUE)
+        await event.reply("🛑 Loop rok diya gaya hai. Current progress save kar li gayi hai.")
+
+    elif text == "/cross reset":
+        save_queue_state([])
+        CHANNELS_QUEUE = []
+        CROSS_LOOP_RUNNING = False
+        await event.reply("🔄 Queue Reset completed! Agli baar process shuru se hoga.")
 
     elif text == "/status":
         db = load_analytics()
-        sorted_channels = sorted(db.items(), key=lambda x: x[1].get("total_joins", 0), reverse=True)
+        sorted_channels = [item for item in db.items() if item[0] != "saved_queue_state"]
+        sorted_channels = sorted(sorted_channels, key=lambda x: x[1].get("total_joins", 0), reverse=True)
         
-        hot_list = []
-        cold_list = []
-        
+        hot_list, cold_list = [], []
         for k, v in sorted_channels:
             history = v.get("time_history", [])
             time_log = ""
@@ -230,7 +272,6 @@ async def controller(event):
                     time_log = f" (Peak: +{best_run['joins']} at {best_run['hour']})"
             
             display_text = f"• {v['title']}  +{v['total_joins']} joins{time_log}"
-            
             if v["total_joins"] > 2:
                 hot_list.append(display_text)
             else:
@@ -250,29 +291,17 @@ async def controller(event):
         await event.reply(status_text)
 
 # ========================================================
-# DATA-DRIVEN TRACKING ENGINE
+# CORE AUTOMATION ENGINE
 # ========================================================
 async def run_cross_loop(source_msg, event):
-    global CROSS_LOOP_RUNNING, status_tracker
-    channels = await get_folder_channels_safely(FOLDER_TARGET_NAME, event)
+    global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
     
-    if not channels:
-        await event.reply(f"❌ Folder '{FOLDER_TARGET_NAME}' khali mila!")
-        CROSS_LOOP_RUNNING = False
-        return
-
-    random.shuffle(channels)
-    db = load_analytics()
-    channels.sort(key=lambda c: db.get(str(c), {}).get("total_joins", 0), reverse=True)
-
-    status_tracker.update({"total": len(channels), "completed": 0, "skipped": 0, "remaining": len(channels)})
-    await event.reply(f"🚀 **Live Join-Tracker Engine Enabled.** Processing {len(channels)} channels...")
-    
-    channels_queue = list(channels)
+    status_tracker.update({"total": len(CHANNELS_QUEUE) + status_tracker['completed'], "remaining": len(CHANNELS_QUEUE)})
     retry_count = {}
 
-    while channels_queue and CROSS_LOOP_RUNNING:
-        channel_id = channels_queue.pop(0)
+    while CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
+        save_queue_state(CHANNELS_QUEUE)  
+        channel_id = CHANNELS_QUEUE.pop(0)
         
         try:
             strict_id = int(f"-100{channel_id}" if not str(channel_id).startswith("-100") else channel_id)
@@ -283,22 +312,24 @@ async def run_cross_loop(source_msg, event):
             ch_title = real_entity.title
             status_tracker["current_channel"] = ch_title
             
-            is_safe, target_link = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""))
+            async for last_msg in client.iter_messages(real_entity, limit=1):
+                is_safe, target_link = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""), last_msg)
+                break
+            else:
+                is_safe, target_link = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""))
             
             if not is_safe:
                 current_retries = retry_count.get(channel_id, 0)
                 if current_retries < 2:
                     retry_count[channel_id] = current_retries + 1
-                    channels_queue.append(channel_id)
+                    CHANNELS_QUEUE.append(channel_id)
                     await asyncio.sleep(5)
                 else:
                     status_tracker["skipped"] += 1
                 continue
 
-            # STEP 1: Get requests count before drop
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
 
-            # STEP 2: Forward Post & Drop Link
             fwd_msgs = await client.forward_messages(real_entity, source_msg)
             fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
             
@@ -306,17 +337,12 @@ async def run_cross_loop(source_msg, event):
             if target_link and target_link != "SKIP_DROP":
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, f"👉 {target_link}")
             
-            # STEP 3: Wait 5 minutes
             await asyncio.sleep(300)
             
-            # STEP 4: Get requests count after drop
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            
-            # STEP 5: Score logging along with time mapping
             gained = after_joins - before_joins
             update_joins_score(channel_id, ch_title, gained)
             
-            # Cleanup trace
             try: await client.delete_messages(real_entity, fwd.id)
             except: pass
             if drop:
@@ -324,21 +350,23 @@ async def run_cross_loop(source_msg, event):
                 except: pass
 
             status_tracker["completed"] += 1
-            
-            if channels_queue and CROSS_LOOP_RUNNING:
+            if CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
                 await asyncio.sleep(random.randint(18, 35))
             
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 5)
-            channels_queue.append(channel_id)
+            CHANNELS_QUEUE.insert(0, channel_id)  
             continue
         except Exception:
             status_tracker["skipped"] += 1
             continue
 
+    if not CHANNELS_QUEUE:
+        save_queue_state([])  
+
     CROSS_LOOP_RUNNING = False
     status_tracker["current_channel"] = "None"
-    await client.send_message('me', "✅ **Automation Loop completed! System clean.**")
+    await client.send_message('me', "✅ **Automation Loop Processed Successfully!**")
 
 @app.before_serving
 async def startup():
