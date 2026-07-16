@@ -24,7 +24,7 @@ api_id = 36094172
 api_hash = "ff6eee1bcccf82daea88c63c45b6b546"
 
 SESSION_STRING = os.environ.get("SESSION_STRING", None)
-# Nayi Target Channel ID yahan update kar di hai (27 wali)
+# Strictly updated your Target Channel ID here
 TARGET_MAIN_CHANNEL = -1002413253133  
 FOLDER_TARGET_NAME = "RAN X CROXX"
 
@@ -395,109 +395,4 @@ async def startup():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
-            json.dump(data, f, indent=4)
-        os.replace(temp_file, DB_FILE)
-    except Exception:
-        pass
-
-def update_joins_score(channel_id, channel_title, joins_gained):
-    db = load_analytics()
-    ch_key = str(channel_id)
     
-    # Current timestamp for Timing Sense analysis
-    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    current_hour = datetime.now().strftime("%I:%M %p") # Example: 04:00 PM
-    
-    if ch_key not in db:
-        db[ch_key] = {
-            "title": channel_title,
-            "total_joins": 0,
-            "runs": 0,
-            "time_history": []
-        }
-    
-    # Handle legacy databases gracefully
-    if "time_history" not in db[ch_key]:
-        db[ch_key]["time_history"] = []
-        
-    db[ch_key]["runs"] += 1
-    db[ch_key]["total_joins"] += max(0, joins_gained)
-    
-    # Save current run analytics with time mapping
-    db[ch_key]["time_history"].append({
-        "timestamp": current_time_str,
-        "hour": current_hour,
-        "joins": max(0, joins_gained)
-    })
-    
-    save_analytics(db)
-
-# ========================================================
-# LIVE JOIN REQUESTS COUNTER
-# ========================================================
-async def get_current_join_requests(target_channel):
-    try:
-        full_channel = await client(GetFullChannelRequest(target_channel))
-        if hasattr(full_channel.full_chat, 'requests_pending'):
-            return full_channel.full_chat.requests_pending or 0
-    except Exception:
-        pass
-    return 0
-
-# ========================================================
-# ADVANCE TELEGRAM-ONLY LINK DETECTOR (ANTI-SKIP SYSTEM)
-# ========================================================
-async def check_and_extract_link(real_entity, channel_username):
-    try:
-        try:
-            pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=1)
-            if pinned_msgs and pinned_msgs[0].message:
-                pin_text = pinned_msgs[0].message.lower()
-                if any(word in pin_text for word in ["no link", "no cross", "admin remove", "cross off"]):
-                    return False, None
-        except Exception:
-            pass
-
-        full_channel = await client(GetFullChannelRequest(real_entity))
-        bio = full_channel.full_chat.about or ""
-        
-        if any(word in bio.lower() for word in ["no link", "no cross", "admin remove", "no promo"]):
-            return False, None
-
-        self_user = channel_username.lower().strip() if channel_username else "____none____"
-        tg_link_pattern = r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?[\w\-]+'
-
-        async for msg in client.iter_messages(real_entity, limit=2):
-            if msg.message:
-                found_links = re.findall(tg_link_pattern, msg.message.lower())
-                for raw_link in found_links:
-                    if self_user in raw_link:
-                        continue
-                    if "bot" in raw_link:
-                        continue
-                    return False, None
-
-        extracted_links = re.findall(tg_link_pattern, bio)
-        if extracted_links:
-            return True, f"https://{extracted_links[0]}"
-        else:
-            if channel_username:
-                return True, f"https://t.me/{channel_username}"
-            else:
-                return True, "SKIP_DROP"
-    except Exception:
-        return True, "SKIP_DROP"
-
-# ========================================================
-# SAFE FOLDER FILTER
-# ========================================================
-async def get_folder_channels_safely(target_name, event):
-    channel_ids = []
-    try:
-        result = await client(GetDialogFiltersRequest())
-        target_clean = str(target_name).strip().lower()
-        filters_list = result.filters if hasattr(result, 'filters') else result
-
-        for dialog_filter in filters_list:
-            if isinstance(dialog_filter, DialogFilter) and dialog_filter.title:
-                folder_title = str(dialog_filter.title.text if hasattr(dialog_filter.title, 'text'
