@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V2.8: Strict Third-Party Link Skipper Active!"
+    return "Official IPL Titan Live Join-Tracker V2.9: Strict Third-Party Link Skipper Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -111,9 +111,9 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# STRICT DETECTOR (SIRF POSTS SCAN - NO BIO CHECK)
+# STRICT DETECTOR (BIO & POST SCANNER)
 # ========================================================
-async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
+async def check_and_extract_link(real_entity, channel_username, msg_obj=None, bio_text=None):
     try:
         # Pinned Message check
         try:
@@ -128,14 +128,23 @@ async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
         self_user = channel_username.lower().strip() if channel_username else "____none____"
         tg_link_pattern = r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?[\w\-]+'
 
-        # Strict Third Party Checker (Bahar ka link hone par True yaani skip kar dega)
+        # Strict Third Party Checker
         def is_third_party_link(url_str):
             u_low = url_str.lower()
             if self_user in u_low or "devil_prediction" in u_low or "bot" in u_low or "titan" in u_low:
                 return False  
             return True  
 
-        # Advanced Entity Scanning (Hidden Text Links in Posts)
+        # 1. Sabse Pehle BIO me se link extract karega agar available ho
+        if bio_text:
+            bio_links = re.findall(tg_link_pattern, bio_text)
+            if bio_links:
+                full_bio_url = f"https://{bio_links[0]}"
+                if is_third_party_link(full_bio_url):
+                    return False, None  # Agar third party link hai bio me, toh strict skip
+                return True, full_bio_url
+
+        # 2. Advanced Entity Scanning (Hidden Text Links in Posts)
         if msg_obj and msg_obj.entities:
             for entity in msg_obj.entities:
                 if isinstance(entity, MessageEntityTextUrl) and entity.url:
@@ -152,7 +161,7 @@ async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
                             return False, None
                         return True, extracted_url
 
-        # Button Scanning
+        # Button Scanning in Posts
         if msg_obj and msg_obj.buttons:
             for row in msg_obj.buttons:
                 for button in row:
@@ -162,7 +171,7 @@ async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
                                 return False, None
                             return True, button.url
 
-        # Regular Text Regex Fallback
+        # Regular Text Regex Fallback in Posts
         if msg_obj and msg_obj.message:
             found_links = re.findall(tg_link_pattern, msg_obj.message)
             for raw_link in found_links:
@@ -171,13 +180,13 @@ async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
                     return False, None
                 return True, full_raw_url
 
-        # Agar post me koi link nahi mila toh khud ka channel link safe return karo
+        # 3. Agar Bio aur Posts dono me kuch nahi mila, toh automatic public username link return karega
         if channel_username:
             return True, f"https://t.me/{channel_username}"
             
-        return True, "SKIP_DROP"
+        return True, None
     except Exception:
-        return True, "SKIP_DROP"
+        return True, None
 
 # ========================================================
 # FOLDER CHANNELS SYSTEM
@@ -318,18 +327,34 @@ async def run_cross_loop(source_msg, event):
             
             is_safe = True
             target_link = None
+
+            # Fetch Channel Bio/About first
+            full_channel = await client(GetFullChannelRequest(real_entity))
+            bio = full_channel.full_chat.about or ""
             
-            # Top 3 posts scan hongi strictly (No Bio Check)
-            async for last_msg in client.iter_messages(real_entity, limit=3):
-                safe_check, extracted_url = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""), last_msg)
-                
-                if not safe_check:
-                    is_safe = False
-                    break
-                
-                if extracted_url and extracted_url != "SKIP_DROP" and not target_link:
-                    target_link = extracted_url
+            # Step 1: Scan Bio
+            safe_check, extracted_url = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""), bio_text=bio)
+            if not safe_check:
+                is_safe = False
+            elif extracted_url:
+                target_link = extracted_url
+
+            # Step 2: Scan Last 3 Posts (Agar Bio me safe link nahi mila toh backup)
+            if is_safe and not target_link:
+                async for last_msg in client.iter_messages(real_entity, limit=3):
+                    safe_check, extracted_url = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""), msg_obj=last_msg)
+                    
+                    if not safe_check:
+                        is_safe = False
+                        break
+                    
+                    if extracted_url and not target_link:
+                        target_link = extracted_url
             
+            # Step 3: Agar posts bhi check kar li aur sab safe hai, par still koi link nahi mila
+            if is_safe and not target_link:
+                is_safe, target_link = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""))
+
             # Strict skip execution
             if not is_safe:
                 current_retries = retry_count.get(channel_id, 0)
@@ -347,8 +372,9 @@ async def run_cross_loop(source_msg, event):
             fwd_msgs = await client.forward_messages(real_entity, source_msg)
             fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
             
+            # Channel Bio or Post se nikala hua proper link aapke channel me drop karega!
             drop = None
-            if target_link and target_link != "SKIP_DROP":
+            if target_link:
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, f"👉 {target_link}")
             
             await asyncio.sleep(300)
@@ -382,7 +408,7 @@ async def run_cross_loop(source_msg, event):
     CROSS_LOOP_RUNNING = False
     status_tracker["current_channel"] = "None"
     
-    # Summary of progress
+    # Final Summary Notification
     summary_text = (
         f"✅ **Automation Loop Processed Successfully!**\n\n"
         f"📊 **Final Summary:**\n"
