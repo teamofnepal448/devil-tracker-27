@@ -24,7 +24,7 @@ api_id = 36094172
 api_hash = "ff6eee1bcccf82daea88c63c45b6b546"
 
 SESSION_STRING = os.environ.get("SESSION_STRING", None)
-# Strictly updated your Target Channel ID here
+# Target Channel ID strictly set to 2413253133
 TARGET_MAIN_CHANNEL = -1002413253133  
 FOLDER_TARGET_NAME = "RAN X CROXX"
 
@@ -111,7 +111,7 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# STRICT DETECTOR (RETURNS FALSE IF THIRD PARTY LINK FOUND)
+# STRICT DETECTOR (SIRF POSTS SCAN - NO BIO CHECK)
 # ========================================================
 async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
     try:
@@ -125,23 +125,17 @@ async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
         except Exception:
             pass
 
-        # Bio / About Check
-        full_channel = await client(GetFullChannelRequest(real_entity))
-        bio = full_channel.full_chat.about or ""
-        if any(word in bio.lower() for word in ["no link", "no cross", "admin remove", "no promo"]):
-            return False, None
-
         self_user = channel_username.lower().strip() if channel_username else "____none____"
         tg_link_pattern = r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?[\w\-]+'
 
-        # Strict Third Party Checker
+        # Strict Third Party Checker (Bahar ka link hone par True yaani skip kar dega)
         def is_third_party_link(url_str):
             u_low = url_str.lower()
             if self_user in u_low or "devil_prediction" in u_low or "bot" in u_low or "titan" in u_low:
                 return False  
             return True  
 
-        # Advanced Entity Scanning (Hidden Text Links)
+        # Advanced Entity Scanning (Hidden Text Links in Posts)
         if msg_obj and msg_obj.entities:
             for entity in msg_obj.entities:
                 if isinstance(entity, MessageEntityTextUrl) and entity.url:
@@ -177,13 +171,7 @@ async def check_and_extract_link(real_entity, channel_username, msg_obj=None):
                     return False, None
                 return True, full_raw_url
 
-        # Bio Fallback
-        extracted_links = re.findall(tg_link_pattern, bio)
-        if extracted_links:
-            if is_third_party_link(extracted_links[0]):
-                return False, None
-            return True, f"https://{extracted_links[0]}"
-        
+        # Agar post me koi link nahi mila toh khud ka channel link safe return karo
         if channel_username:
             return True, f"https://t.me/{channel_username}"
             
@@ -249,6 +237,10 @@ async def controller(event):
             db = load_analytics()
             channels.sort(key=lambda c: db.get(str(c), {}).get("total_joins", 0), reverse=True)
             CHANNELS_QUEUE = list(channels)
+            
+            # Reset tracker
+            status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
+            
             await event.reply(f"🚀 **Live Join-Tracker Engine Enabled.** Processing {len(CHANNELS_QUEUE)} channels...")
 
         asyncio.get_event_loop().create_task(run_cross_loop(reply_msg, event))
@@ -262,6 +254,7 @@ async def controller(event):
         save_queue_state([])
         CHANNELS_QUEUE = []
         CROSS_LOOP_RUNNING = False
+        status_tracker.update({"total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"})
         await event.reply("🔄 Queue Reset completed! Agli baar process shuru se hoga.")
 
     elif text == "/status":
@@ -284,16 +277,19 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']}  {v['total_joins']} join")
                 
-        hot_display = "\n".join(hot_list[:5]) or "No Hot Channels Yet."
-        cold_display = "\n".join(cold_list[:5]) or "No Cold Channels Yet."
+        # EXTENDED TO 10 CHANNELS FOR BOTH HOT & COLD ZONES
+        hot_display = "\n".join(hot_list[:10]) or "No Hot Channels Yet."
+        cold_display = "\n".join(cold_list[:10]) or "No Cold Channels Yet."
         
         status_text = (
             f"📊 **DEVIL LIVE TRACKER STATUS**\n\n"
             f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
             f"• Processed: {status_tracker['completed']} / {status_tracker['total']}\n"
+            f"• Skipped: {status_tracker['skipped']}\n"
+            f"• Remaining: {status_tracker['remaining']}\n"
             f"• Current Focus: **{status_tracker['current_channel']}**\n\n"
-            f"🔥 **HOT ZONE (Top Gainers + Best Time)**\n{hot_display}\n\n"
-            f"❄️ **COLD ZONE (Dead Channels)**\n{cold_display}"
+            f"🔥 **HOT ZONE (Top 10 Gainers + Best Time)**\n{hot_display}\n\n"
+            f"❄️ **COLD ZONE (Top 10 Dead Channels)**\n{cold_display}"
         )
         await event.reply(status_text)
 
@@ -309,6 +305,7 @@ async def run_cross_loop(source_msg, event):
     while CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
         save_queue_state(CHANNELS_QUEUE)  
         channel_id = CHANNELS_QUEUE.pop(0)
+        status_tracker["remaining"] = len(CHANNELS_QUEUE)
         
         try:
             strict_id = int(f"-100{channel_id}" if not str(channel_id).startswith("-100") else channel_id)
@@ -322,7 +319,7 @@ async def run_cross_loop(source_msg, event):
             is_safe = True
             target_link = None
             
-            # Top 3 posts scan hongi
+            # Top 3 posts scan hongi strictly (No Bio Check)
             async for last_msg in client.iter_messages(real_entity, limit=3):
                 safe_check, extracted_url = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""), last_msg)
                 
@@ -333,18 +330,15 @@ async def run_cross_loop(source_msg, event):
                 if extracted_url and extracted_url != "SKIP_DROP" and not target_link:
                     target_link = extracted_url
             
-            if is_safe and not target_link:
-                is_safe, target_link = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""))
-
             # Strict skip execution
             if not is_safe:
                 current_retries = retry_count.get(channel_id, 0)
                 if current_retries < 2:
                     retry_count[channel_id] = current_retries + 1
                     CHANNELS_QUEUE.append(channel_id)
-                    await asyncio.sleep(5)
                 else:
                     status_tracker["skipped"] += 1
+                    status_tracker["completed"] += 1
                 continue
 
             # ----- FORWARD SECTOR -----
@@ -379,6 +373,7 @@ async def run_cross_loop(source_msg, event):
             continue
         except Exception:
             status_tracker["skipped"] += 1
+            status_tracker["completed"] += 1
             continue
 
     if not CHANNELS_QUEUE:
@@ -386,7 +381,16 @@ async def run_cross_loop(source_msg, event):
 
     CROSS_LOOP_RUNNING = False
     status_tracker["current_channel"] = "None"
-    await client.send_message('me', "✅ **Automation Loop Processed Successfully!**")
+    
+    # Summary of progress
+    summary_text = (
+        f"✅ **Automation Loop Processed Successfully!**\n\n"
+        f"📊 **Final Summary:**\n"
+        f"• Total Channels in Folder: {status_tracker['total']}\n"
+        f"• Successfully Processed/Forwarded: {status_tracker['completed'] - status_tracker['skipped']}\n"
+        f"• Skipped (Third Party Links/Errors): {status_tracker['skipped']}"
+    )
+    await client.send_message('me', summary_text)
 
 @app.before_serving
 async def startup():
@@ -395,4 +399,3 @@ async def startup():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
-    
