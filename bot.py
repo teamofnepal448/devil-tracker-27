@@ -1,7 +1,7 @@
 """
 IPL Titan Live Join-Tracker V2.8 - Optimized Version with Local Database
 Strict Third-Party Link Skipper Active & Full Analytics Restored
-Optimized for 24/7 Render Cloud Deployment with Port Binding Fix
+Optimized for 24/7 Render Cloud Deployment with Quart Port Binding Fix
 """
 
 from telethon import TelegramClient, events, errors
@@ -24,14 +24,14 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from datetime import datetime
 
-# Render Port Binding support ke liye (taaki port timeout se crash na ho)
-from fastapi import FastAPI
+# Quart is used here for port binding as it is already in requirements.txt
+from quart import Quart
 import uvicorn
 
-app = FastAPI()
+app = Quart(__name__)
 
-@app.get("/")
-def read_root():
+@app.route("/")
+async def read_root():
     return {"status": "running", "bot": "IPL Titan Live Join-Tracker V2.8"}
 
 # ============================================================
@@ -494,7 +494,7 @@ async def main():
     config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
     server = uvicorn.Server(config)
     
-    # Telethon aur FastAPI dono ko parallel chalaenge taaki port alive rhe
+    # Telethon aur Quart Web App dono ko parallel chalayein
     await asyncio.gather(
         server.serve(),
         run_telethon()
