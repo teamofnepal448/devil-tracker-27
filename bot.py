@@ -2,7 +2,7 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned, MessageEntityTextUrl, MessageEntityUrl, MessageEntityMention
+from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned
 import asyncio
 import os
 import re
@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V3.4: Strict Username Mention Skipper Active!"
+    return "Official IPL Titan Live Join-Tracker V3.6: ID Resolution Engine Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -110,121 +110,71 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# ADVANCED STRIKT DETECTOR (SCANS LINKS & @MENTIONS)
+# DIRECT ID RESOLUTION DETECTOR (FOOLPROOF CLICK & COMPARE)
 # ========================================================
-async def check_and_extract_link(real_entity, channel_username, msg_obj=None, bio_text=None):
+async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     """
-    Returns: (is_safe, extracted_link, status_message)
-    Teesre bande ka URL ya @username mention milte hi channel ko Unsafe mark karega.
+    Post ya bio me se saare links nikal kar unhe 'click' (resolve) karega.
+    Agar koi link kisi teesre bande ke channel par le jata hai -> (False, None, Reason)
+    Agar link usi channel ka hai ya safe hai -> (True, Final_Link, Reason)
     """
+    current_channel_id = current_channel_entity.id
+    current_username = getattr(current_channel_entity, 'username', '')
+    current_username_lower = current_username.lower().strip() if current_username else "___none___"
+
+    # Pinned ya post me text blacklist check karne ke liye helper
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo"]
     
-    try:
-        # 1. Pinned Message Blacklist Word Check
+    # 1. Extract all potential Telegram tokens/links from text
+    all_text = bio_text + " "
+    for msg in messages_list:
+        if msg.message:
+            all_text += msg.message + " "
+            # Pinned Word check shortcut
+            if any(word in msg.message.lower() for word in blacklist_words):
+                return False, None, "❌ Blacklist word detected in channel text"
+
+    # Find raw links and @usernames
+    tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', all_text)
+    mentions = re.findall(r'@([\w\-]+)', all_text)
+    
+    combined_tokens = list(set(tg_links + mentions))
+    
+    valid_extracted_link = None
+
+    # 2. Click/Resolve each link to check destination ID
+    for token in combined_tokens:
+        token_clean = token.lower().strip()
+        
+        # Whitelist filters to avoid unnecessary API calls on manager/bot names
+        if "devil" in token_clean or "titan" in token_clean or "bot" in token_clean or token_clean == current_username_lower:
+            continue
+            
         try:
-            pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=1)
-            if pinned_msgs and pinned_msgs[0].message:
-                pin_text = pinned_msgs[0].message.lower()
-                if any(word in pin_text for word in blacklist_words):
-                    return False, None, f"❌ Pinned message contains blacklist text: '{pin_text[:30]}...'"
+            # Direct link resolution simulation (Simulating the click)
+            resolved_entity = await client.get_entity(token)
+            resolved_id = resolved_entity.id
+            
+            # AGE MATCH: Agar ID match nahi hui matlab teesra banda hai!
+            if resolved_id != current_channel_id:
+                return False, None, f"❌ Link/Mention points to third-party ID: {resolved_id} (@{token})"
+            else:
+                # Agar usi channel ka link hai to drop ke liye save kar lo
+                if token in tg_links:
+                    valid_extracted_link = f"https://t.me/{token}"
         except Exception:
-            pass
+            # Agar resolve nahi ho raha (invalid hash, external string, private group link without access),
+            # toh use third-party dangerous nahi manenge, default safe chord denge.
+            continue
 
-        # 2. Bio Blacklist Word Check
-        if bio_text:
-            if any(word in bio_text.lower() for word in blacklist_words):
-                return False, None, f"❌ Bio contains blacklist text: '{bio_text[:30]}...'"
-
-        self_user = channel_username.lower().strip() if channel_username else "____none____"
-        tg_link_pattern = r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)'
-        raw_mention_pattern = r'@([\w\-]+)'
-
-        def is_third_party(identifier_str):
-            """Returns True agar token teesre bande ka hai (Apna ya is channel ka nahi hai)"""
-            clean_str = identifier_str.lower().strip()
-            # Agar string me is channel ka username, devil, titan ya bot key hai toh safe hai
-            if self_user in clean_str or "devil" in clean_str or "bot" in clean_str or "titan" in clean_str:
-                return False
-            return True
-
-        # ---- DUAL SCANNING FUNCTION FOR TEXTS ----
-        def scan_text_for_third_party(text_content):
-            if not text_content:
-                return False, None, None
-            
-            # Check URLs in text
-            found_urls = re.findall(tg_link_pattern, text_content)
-            for path_name in found_urls:
-                if is_third_party(path_name):
-                    return True, "URL", f"❌ Found third-party link path: @{path_name}"
-            
-            # Check Plain Username @ Mentions in text
-            found_mentions = re.findall(raw_mention_pattern, text_content)
-            for mention_name in found_mentions:
-                if is_third_party(mention_name):
-                    return True, "MENTION", f"❌ Found third-party @mention: @{mention_name}"
-            
-            return False, None, None
-
-        # 3. Scan Bio for Third Party Assets
-        if bio_text:
-            has_3rd_party, _, reason_str = scan_text_for_third_party(bio_text)
-            if has_3rd_party:
-                return False, None, reason_str
-
-        # 4. Scan Post Entities & Text (Hidden & Open Mentions)
-        if msg_obj:
-            # Check Entities first
-            if msg_obj.entities:
-                for entity in msg_obj.entities:
-                    # Hidden Text Links
-                    if isinstance(entity, MessageEntityTextUrl) and entity.url:
-                        url_match = re.search(tg_link_pattern, entity.url.lower())
-                        if url_match:
-                            path_extracted = url_match.group(1)
-                            if is_third_party(path_extracted):
-                                return False, None, f"❌ Hidden TextUrl points to third-party: {entity.url}"
-                    
-                    # Direct Link Entities
-                    elif isinstance(entity, MessageEntityUrl) and msg_obj.message:
-                        extracted_url = msg_obj.message[entity.offset : entity.offset + entity.length]
-                        url_match = re.search(tg_link_pattern, extracted_url.lower())
-                        if url_match:
-                            path_extracted = url_match.group(1)
-                            if is_third_party(path_extracted):
-                                return False, None, f"❌ Raw URL Entity points to third-party: {extracted_url}"
-                    
-                    # Clickable @Mention Entities
-                    elif isinstance(entity, MessageEntityMention) and msg_obj.message:
-                        extracted_mention = msg_obj.message[entity.offset : entity.offset + entity.length].replace("@", "")
-                        if is_third_party(extracted_mention):
-                            return False, None, f"❌ Clickable @mention Entity points to third-party: @{extracted_mention}"
-
-            # Check Button URLs
-            if msg_obj.buttons:
-                for row in msg_obj.buttons:
-                    for button in row:
-                        if button.url:
-                            url_match = re.search(tg_link_pattern, button.url.lower())
-                            if url_match:
-                                path_extracted = url_match.group(1)
-                                if is_third_party(path_extracted):
-                                    return False, None, f"❌ Inline button points to third-party URL: {button.url}"
-
-            # Check Plain Body Text / Caption
-            if msg_obj.message:
-                has_3rd_party, _, reason_str = scan_text_for_third_party(msg_obj.message)
-                if has_3rd_party:
-                    return False, None, reason_str
-
-        # 5. Extract our own link if present in Post/Bio for dropping, otherwise fallback
-        if channel_username:
-            return True, f"https://t.me/{channel_username}", "ℹ️ Verified Safe: No third-party links or mentions found, using channel link"
-
-        return True, "SKIP_DROP", "⚠️ Safe but channel username structure is missing"
-
-    except Exception as e:
-        return True, "SKIP_DROP", f"⚠️ Exception inside strict analyzer: {str(e)}"
+    # 3. Final link assignment logic
+    if valid_extracted_link:
+        return True, valid_extracted_link, "✅ Verified Safe: Link points to the same channel"
+        
+    if current_username:
+        return True, f"https://t.me/{current_username}", "ℹ️ Safe: Falling back to official channel username link"
+        
+    return True, "SKIP_DROP", "⚠️ Safe but no drop link could be fetched"
 
 # ========================================================
 # FOLDER CHANNELS SYSTEM
@@ -326,7 +276,7 @@ async def controller(event):
         cold_display = "\n".join(cold_list[:5]) or "No Cold Channels Yet."
         
         status_text = (
-            f"📊 **%s STATUS**\n\n" % "DEVIL LIVE TRACKER"
+            f"📊 **DEVIL LIVE TRACKER STATUS**\n\n"
             f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
             f"• Processed: {status_tracker['completed']} / {status_tracker['total']}\n"
             f"• Skipped: {status_tracker['skipped']}\n"
@@ -356,39 +306,40 @@ async def run_cross_loop(source_msg, event):
             if strict_id == int(TARGET_MAIN_CHANNEL):
                 continue
 
-            real_entity = await client.get_entity(strict_id)
+            try:
+                real_entity = await client.get_entity(strict_id)
+            except ValueError:
+                status_tracker["skipped"] += 1
+                status_tracker["completed"] += 1
+                await client.send_message('me', f"❌ [ENTITY ERROR SKIP] **ID: {channel_id}**\nReason: Channel not cached or requires manual access.")
+                continue
+
             ch_title = real_entity.title
             status_tracker["current_channel"] = ch_title
             
-            is_safe = True
-            target_link = None
-            debug_reason = "Initial logic status clear"
-
-            # 1. Fetch Bio Details first
-            full_channel = await client(GetFullChannelRequest(real_entity))
-            bio = full_channel.full_chat.about or ""
-            
-            safe_check, extracted_url, reason = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""), bio_text=bio)
-            debug_reason = reason
-            if not safe_check:
-                is_safe = False
-            elif extracted_url and extracted_url != "SKIP_DROP":
-                target_link = extracted_url
-
-            # 2. Scan Last 3 Posts for nested links/mentions
-            if is_safe and not target_link:
+            # 1. Fetch Pinned & Last 3 messages for structural ID scanning
+            messages_to_scan = []
+            try:
                 async for last_msg in client.iter_messages(real_entity, limit=3):
-                    safe_check, extracted_url, reason = await check_and_extract_link(real_entity, getattr(real_entity, 'username', ""), msg_obj=last_msg)
-                    if not safe_check:
-                        is_safe = False
-                        debug_reason = reason
-                        break
-                    if extracted_url and extracted_url != "SKIP_DROP":
-                        target_link = extracted_url
-                        debug_reason = reason
-                        break
+                    messages_to_scan.append(last_msg)
+                pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=1)
+                if pinned_msgs:
+                    messages_to_scan.append(pinned_msgs[0])
+            except Exception:
+                pass
 
-            # STRIKT CHECK: Agar teesre bande ka link/mention mila to execution seedha drop hoga
+            # 2. Extract Bio Text (Only for link collection, no bio skipping applied)
+            bio = ""
+            try:
+                full_channel = await client(GetFullChannelRequest(real_entity))
+                bio = full_channel.full_chat.about or ""
+            except Exception:
+                pass
+
+            # 3. Verify Links via Instant ID Verification (Click simulation)
+            is_safe, target_link, debug_reason = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
+
+            # EXECUTION SKIPPING AND RETRY MANAGEMENT
             if not is_safe or not target_link or target_link == "SKIP_DROP":
                 current_retries = retry_count.get(channel_id, 0)
                 if current_retries < 2:
@@ -398,11 +349,11 @@ async def run_cross_loop(source_msg, event):
                 else:
                     status_tracker["skipped"] += 1
                     status_tracker["completed"] += 1
-                    await client.send_message('me', f"⏭️ [SKIPPED BLACKLISTED/THIRD-PARTY] **{ch_title}**\nReason: {debug_reason}")
+                    await client.send_message('me', f"⏭️ [SKIPPED PERMANENTLY] **{ch_title}**\nReason: {debug_reason}")
                 continue
 
             # ----- FORWARD SECTOR -----
-            await client.send_message('me', f"📢 [PROCESSING] **{ch_title}**\nAction: Link verified safe\nLink to Drop: {target_link}")
+            await client.send_message('me', f"📢 [PROCESSING] **{ch_title}**\nAction: Link Verified Safe (Points to Target Channel)\nLink to Drop: {target_link}")
 
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
 
@@ -451,7 +402,7 @@ async def run_cross_loop(source_msg, event):
         f"📊 **Final Summary:**\n"
         f"• Total Channels in Folder: {status_tracker['total']}\n"
         f"• Successfully Processed: {status_tracker['completed'] - status_tracker['skipped']}\n"
-        f"• Skipped / Mentions Detected: {status_tracker['skipped']}"
+        f"• Skipped / Third-Party IDs: {status_tracker['skipped']}"
     )
     await client.send_message('me', summary_text)
 
