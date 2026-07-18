@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V4.0: Final Bio & Admin ID Fixed!"
+    return "Official IPL Titan Live Join-Tracker V4.1: Bio Fallback & Anti-Spam Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -110,7 +110,7 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# ADVANCED LINK DETECTOR (BIO EXCLUDED + ADMIN ID IGNORED)
+# ADVANCED LINK DETECTOR (WITH BIO FALLBACK)
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     current_channel_id = current_channel_entity.id
@@ -119,51 +119,39 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
 
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo"]
     
-    # 1. Sirf Posts ka Text nikalna (Bio ko shamil NAHI kiya gaya)
     post_text = " "
     for msg in messages_list:
         if msg.message:
             post_text += msg.message + " "
-            # Pinned ya Post me agar blacklist word hai to hi skip
             if any(word in msg.message.lower() for word in blacklist_words):
-                return False, None, "❌ Blacklist word detected in channel post/pinned text"
-
-    # Posts se Raw links aur @usernames nikalna
+                return False, None
+                
     post_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', post_text)
     post_mentions = re.findall(r'@([\w\-]+)', post_text)
     post_tokens = list(set(post_tg_links + post_mentions))
     
     valid_extracted_link = None
 
-    # 2. POSTS KI CHECKING (Third Party CHANNEL pe skip karega)
     for token in post_tokens:
         token_clean = token.lower().strip()
         
-        # White list bypass
         if "devil" in token_clean or "titan" in token_clean or "bot" in token_clean or token_clean == current_username_lower:
             continue
             
         try:
             resolved_entity = await client.get_entity(token)
-            
-            # 🔥 MAIN FIX: Agar mention kisi User (Admin Account) ka hai, to skip nahi karna hai, Safe hai!
             if isinstance(resolved_entity, User):
                 continue
                 
             resolved_id = resolved_entity.id
-            
-            # Agar ID alag hai aur wo Channel hai, tabhi skip hoga
             if resolved_id != current_channel_id:
-                return False, None, f"❌ Post contains third-party Channel ID: {resolved_id} (@{token})"
+                return False, None
             else:
-                # Agar usi channel ka link post me mil gaya
                 if token in post_tg_links:
                     valid_extracted_link = f"https://t.me/{token}"
         except Exception:
-            # Agar link/hash check nahi ho raha, default safe
             continue
 
-    # 3. BIO KI CHECKING (Sirf apna Drop Link dhoondhne ke liye, Skip kabhi nahi karega)
     if not valid_extracted_link and bio_text:
         bio_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', bio_text)
         for token in bio_tg_links:
@@ -175,14 +163,19 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
             except Exception:
                 continue
 
-    # 4. FINAL LOGIC
+    # 🔥 MAIN FIX: BIO FALLBACK LOGIC 
     if valid_extracted_link:
-        return True, valid_extracted_link, "✅ Verified Safe: Link found in text/bio points to this channel"
+        return True, valid_extracted_link
         
+    # Agar link na mile aur bio me kuch likha ho to seedha poora bio daal do
+    if bio_text and len(bio_text.strip()) > 0:
+        return True, bio_text.strip()
+        
+    # Agar bio bhi khali hai to username
     if current_username:
-        return True, f"https://t.me/{current_username}", "ℹ️ Safe: Falling back to official channel username link"
+        return True, f"https://t.me/{current_username}"
         
-    return True, "SKIP_DROP", "⚠️ Safe but no drop link could be fetched"
+    return True, "SKIP_DROP"
 
 # ========================================================
 # FOLDER CHANNELS SYSTEM
@@ -244,7 +237,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
             
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Live Join-Tracker Engine Enabled.** Processing {len(CHANNELS_QUEUE)} channels...")
+            await event.reply(f"🚀 **Live Join-Tracker Engine Enabled.** Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
 
         asyncio.get_event_loop().create_task(run_cross_loop(reply_msg, event))
         
@@ -280,8 +273,9 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']}  {v['total_joins']} join")
                 
-        hot_display = "\n".join(hot_list[:5]) or "No Hot Channels Yet."
-        cold_display = "\n".join(cold_list[:5]) or "No Cold Channels Yet."
+        # 🔥 MAIN FIX: LIMIT 10-10 CHANNELS
+        hot_display = "\n".join(hot_list[:10]) or "No Hot Channels Yet."
+        cold_display = "\n".join(cold_list[:10]) or "No Cold Channels Yet."
         
         status_text = (
             f"📊 **DEVIL LIVE TRACKER STATUS**\n\n"
@@ -290,13 +284,13 @@ async def controller(event):
             f"• Skipped: {status_tracker['skipped']}\n"
             f"• Remaining: {status_tracker['remaining']}\n"
             f"• Current Focus: **{status_tracker['current_channel']}**\n\n"
-            f"🔥 **HOT ZONE (Top Gainers + Best Time)**\n{hot_display}\n\n"
-            f"❄️ **COLD ZONE (Dead Channels)**\n{cold_display}"
+            f"🔥 **HOT ZONE (Top 10 Gainers)**\n{hot_display}\n\n"
+            f"❄️ **COLD ZONE (Bottom 10 Channels)**\n{cold_display}"
         )
         await event.reply(status_text)
 
 # ========================================================
-# CORE AUTOMATION ENGINE 
+# CORE AUTOMATION ENGINE (SILENT & ANTI-SPAM)
 # ========================================================
 async def run_cross_loop(source_msg, event):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
@@ -319,13 +313,11 @@ async def run_cross_loop(source_msg, event):
             except ValueError:
                 status_tracker["skipped"] += 1
                 status_tracker["completed"] += 1
-                await client.send_message('me', f"❌ [ENTITY ERROR SKIP] **ID: {channel_id}**\nReason: Channel not cached or requires manual access.")
                 continue
 
             ch_title = real_entity.title
             status_tracker["current_channel"] = ch_title
             
-            # 1. Fetch Pinned & Last 3 messages for structural ID scanning
             messages_to_scan = []
             try:
                 async for last_msg in client.iter_messages(real_entity, limit=3):
@@ -336,7 +328,6 @@ async def run_cross_loop(source_msg, event):
             except Exception:
                 pass
 
-            # 2. Extract Bio Text
             bio = ""
             try:
                 full_channel = await client(GetFullChannelRequest(real_entity))
@@ -344,33 +335,36 @@ async def run_cross_loop(source_msg, event):
             except Exception:
                 pass
 
-            # 3. Verify Links 
-            is_safe, target_link, debug_reason = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
+            # VERIFY LINKS
+            is_safe, target_link = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
 
-            # EXECUTION SKIPPING AND RETRY MANAGEMENT
+            # 🔥 MAIN FIX: SILENT RETRY/SKIP (No spamming in saved messages)
             if not is_safe or not target_link or target_link == "SKIP_DROP":
                 current_retries = retry_count.get(channel_id, 0)
                 if current_retries < 2:
                     retry_count[channel_id] = current_retries + 1
                     CHANNELS_QUEUE.append(channel_id)
-                    await client.send_message('me', f"🔄 [RETRY {current_retries+1}/2] **{ch_title}**\nReason: {debug_reason}")
                 else:
                     status_tracker["skipped"] += 1
                     status_tracker["completed"] += 1
-                    await client.send_message('me', f"⏭️ [SKIPPED PERMANENTLY] **{ch_title}**\nReason: {debug_reason}")
                 continue
 
-            # ----- FORWARD SECTOR -----
-            await client.send_message('me', f"📢 [PROCESSING] **{ch_title}**\nAction: Safe Link Confirmed\nLink to Drop: {target_link}")
-
+            # ----- FORWARD SECTOR (ANTI-SPAM) -----
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-
+            
+            # Forward action
             fwd_msgs = await client.forward_messages(real_entity, source_msg)
             fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
             
+            # Anti-Spam Micro Delay 
+            await asyncio.sleep(random.uniform(1.5, 3.8))
+            
+            # Drop Action
             drop = None
             if target_link:
-                drop = await client.send_message(TARGET_MAIN_CHANNEL, f"👉 {target_link}")
+                # Agar fallback me sirf bio mila hai, toh usko as it is daalega, otherwise regular format me.
+                drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
+                drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
             
             await asyncio.sleep(300)
             
@@ -380,23 +374,25 @@ async def run_cross_loop(source_msg, event):
             
             try: await client.delete_messages(real_entity, fwd.id)
             except: pass
+            
+            await asyncio.sleep(random.uniform(0.5, 1.5)) # Anti-Spam Micro Delay
+            
             if drop:
                 try: await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
                 except: pass
 
             status_tracker["completed"] += 1
             if CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
-                await asyncio.sleep(random.randint(18, 35))
+                # Increased Random Sleep to mimic human behavior
+                await asyncio.sleep(random.randint(20, 45))
             
         except errors.FloodWaitError as e:
-            await client.send_message('me', f"⏳ [FLOOD WAIT] Waiting {e.seconds}s. Pushing channel back to queue.")
             await asyncio.sleep(e.seconds + 5)
             CHANNELS_QUEUE.insert(0, channel_id)  
             continue
-        except Exception as e:
+        except Exception:
             status_tracker["skipped"] += 1
             status_tracker["completed"] += 1
-            await client.send_message('me', f"❌ [ERROR SKIP] **Channel ID: {channel_id}**\nError: {str(e)}")
             continue
 
     if not CHANNELS_QUEUE:
@@ -405,8 +401,9 @@ async def run_cross_loop(source_msg, event):
     CROSS_LOOP_RUNNING = False
     status_tracker["current_channel"] = "None"
     
+    # Send final summary at the end
     summary_text = (
-        f"✅ **Automation Loop Processed Successfully!**\n\n"
+        f"✅ **Silent Automation Loop Completed!**\n\n"
         f"📊 **Final Summary:**\n"
         f"• Total Channels in Folder: {status_tracker['total']}\n"
         f"• Successfully Processed: {status_tracker['completed'] - status_tracker['skipped']}\n"
