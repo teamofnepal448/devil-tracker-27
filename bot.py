@@ -1,8 +1,8 @@
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetDialogFiltersRequest
+from telethon.tl.functions.messages import GetDialogFiltersRequest, CheckChatInviteRequest
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned, User
+from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned, User, ChatInviteAlready, ChatInvite
 import asyncio
 import os
 import re
@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V4.3: Button & Hidden Link Detector Active!"
+    return "Official IPL Titan Live Join-Tracker V4.4: Deep Cross-Detector Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -110,7 +110,52 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# UPGRADED LINK DETECTOR (V4.3 - HIDDEN LINKS & BUTTONS)
+# SINGLE TOKEN / LINK RESOLVER
+# ========================================================
+async def check_single_token(client_obj, token, current_channel_id):
+    token_clean = token.strip()
+    
+    # 1. Check Private Invite Hashes (+ or joinchat/)
+    invite_hash = None
+    if token_clean.startswith("+"):
+        invite_hash = token_clean[1:]
+    elif "joinchat/" in token_clean:
+        invite_hash = token_clean.split("joinchat/")[-1]
+
+    if invite_hash:
+        try:
+            res = await client_obj(CheckChatInviteRequest(invite_hash))
+            target_id = None
+            if isinstance(res, ChatInviteAlready) and hasattr(res, 'chat'):
+                target_id = res.chat.id
+            elif isinstance(res, ChatInvite) and hasattr(res, 'chat'):
+                target_id = res.chat.id
+
+            if target_id and abs(target_id) == abs(current_channel_id):
+                return True, f"https://t.me/+{invite_hash}"
+            else:
+                return False, None  # Dusre channel ki private link hai!
+        except Exception:
+            # Unverified private link in post -> UNSAFE!
+            return False, None
+
+    # 2. Check Public Usernames / Links
+    try:
+        check_token = token_clean if token_clean.startswith("@") or token_clean.startswith("http") else f"https://t.me/{token_clean}"
+        entity = await client_obj.get_entity(check_token)
+        
+        if isinstance(entity, User):
+            return None, None  # User mentions/bots ko ignore karo
+            
+        if abs(entity.id) == abs(current_channel_id):
+            return True, f"https://t.me/{token_clean.replace('@', '')}"
+        else:
+            return False, None  # Dusre public channel ki link hai!
+    except Exception:
+        return False, None
+
+# ========================================================
+# UPGRADED LINK DETECTOR (V4.4 - STRICT BLOCKING)
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     current_channel_id = current_channel_entity.id
@@ -120,70 +165,59 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo"]
     
     post_text = " "
+    
     for msg in messages_list:
+        # 🔥 CHECK 1: FORWARDED MESSAGE DETECTION
+        if hasattr(msg, 'fwd_from') and msg.fwd_from:
+            fwd_channel_id = None
+            if hasattr(msg.fwd_from, 'from_id') and msg.fwd_from.from_id:
+                if hasattr(msg.fwd_from.from_id, 'channel_id'):
+                    fwd_channel_id = msg.fwd_from.from_id.channel_id
+            if fwd_channel_id and abs(fwd_channel_id) != abs(current_channel_id):
+                return False, None  # Dusre channel se forward post = REJECT
+
         if msg.message:
             post_text += msg.message + " "
             if any(word in msg.message.lower() for word in blacklist_words):
                 return False, None
                 
-            # 🔥 HIDDEN HYPERLINKS EXTRACTOR (MessageEntityTextUrl)
-            if msg.entities:
-                for entity in msg.entities:
-                    if hasattr(entity, 'url') and entity.url:
-                        post_text += " " + entity.url
-                        
-        # 🔥 INLINE KEYBOARD BUTTON URL EXTRACTOR
+        # Hidden Hyperlinks
+        if msg.entities:
+            for entity in msg.entities:
+                if hasattr(entity, 'url') and entity.url:
+                    post_text += " " + entity.url
+                    
+        # Inline Keyboard Buttons
         if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
             for row in msg.reply_markup.rows:
                 for button in row.buttons:
                     if hasattr(button, 'url') and button.url:
                         post_text += " " + button.url
-                        
-    # Ab Super Regex post text, hidden urls, aur button urls sabko ek sath scan karega
+
+    # Regex Extraction
     post_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(joinchat/[\w\-]+|\+[\w\-]+|[\w\-]+)', post_text)
     post_mentions = re.findall(r'@([\w\-]+)', post_text)
     post_tokens = list(set(post_tg_links + post_mentions))
-    
+
     valid_extracted_link = None
 
     for token in post_tokens:
         token_clean = token.lower().strip()
         
-        # Whitelist
         if "devil" in token_clean or "titan" in token_clean or "bot" in token_clean or token_clean == current_username_lower:
             continue
             
-        try:
-            check_token = f"https://t.me/{token}" if not token.startswith("@") else token
-            resolved_entity = await client.get_entity(check_token)
-            
-            if isinstance(resolved_entity, User):
-                continue
-                
-            resolved_id = resolved_entity.id
-            if resolved_id != current_channel_id:
-                return False, None # Third party channel mila (Post, Button ya Hidden Link se)
-            else:
-                if token in post_tg_links:
-                    valid_extracted_link = f"https://t.me/{token}"
-        except Exception:
-            continue
+        is_same_channel, resolved_link = await check_single_token(client, token, current_channel_id)
+        
+        if is_same_channel is False:
+            return False, None  # 🔥 Third party link milte hi REJECT!
+        elif is_same_channel is True and resolved_link:
+            valid_extracted_link = resolved_link
 
-    if not valid_extracted_link and bio_text:
-        bio_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(joinchat/[\w\-]+|\+[\w\-]+|[\w\-]+)', bio_text)
-        for token in bio_tg_links:
-            try:
-                resolved_entity = await client.get_entity(f"https://t.me/{token}")
-                if resolved_entity.id == current_channel_id:
-                    valid_extracted_link = f"https://t.me/{token}"
-                    break
-            except Exception:
-                continue
-
-    # FINAL FALLBACK LOGIC
     if valid_extracted_link:
         return True, valid_extracted_link
-        
+
+    # Agar post me koi galat link nahi mili, tabhi Bio Fallback chalega
     if bio_text and len(bio_text.strip()) > 0:
         return True, bio_text.strip()
         
