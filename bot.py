@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V4.1: Bio Fallback & Anti-Spam Active!"
+    return "Official IPL Titan Live Join-Tracker V4.3: Button & Hidden Link Detector Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -110,7 +110,7 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# ADVANCED LINK DETECTOR (WITH BIO FALLBACK)
+# UPGRADED LINK DETECTOR (V4.3 - HIDDEN LINKS & BUTTONS)
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     current_channel_id = current_channel_entity.id
@@ -126,7 +126,21 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
             if any(word in msg.message.lower() for word in blacklist_words):
                 return False, None
                 
-    post_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', post_text)
+            # 🔥 HIDDEN HYPERLINKS EXTRACTOR (MessageEntityTextUrl)
+            if msg.entities:
+                for entity in msg.entities:
+                    if hasattr(entity, 'url') and entity.url:
+                        post_text += " " + entity.url
+                        
+        # 🔥 INLINE KEYBOARD BUTTON URL EXTRACTOR
+        if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
+            for row in msg.reply_markup.rows:
+                for button in row.buttons:
+                    if hasattr(button, 'url') and button.url:
+                        post_text += " " + button.url
+                        
+    # Ab Super Regex post text, hidden urls, aur button urls sabko ek sath scan karega
+    post_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(joinchat/[\w\-]+|\+[\w\-]+|[\w\-]+)', post_text)
     post_mentions = re.findall(r'@([\w\-]+)', post_text)
     post_tokens = list(set(post_tg_links + post_mentions))
     
@@ -135,17 +149,20 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     for token in post_tokens:
         token_clean = token.lower().strip()
         
+        # Whitelist
         if "devil" in token_clean or "titan" in token_clean or "bot" in token_clean or token_clean == current_username_lower:
             continue
             
         try:
-            resolved_entity = await client.get_entity(token)
+            check_token = f"https://t.me/{token}" if not token.startswith("@") else token
+            resolved_entity = await client.get_entity(check_token)
+            
             if isinstance(resolved_entity, User):
                 continue
                 
             resolved_id = resolved_entity.id
             if resolved_id != current_channel_id:
-                return False, None
+                return False, None # Third party channel mila (Post, Button ya Hidden Link se)
             else:
                 if token in post_tg_links:
                     valid_extracted_link = f"https://t.me/{token}"
@@ -153,25 +170,23 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
             continue
 
     if not valid_extracted_link and bio_text:
-        bio_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', bio_text)
+        bio_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(joinchat/[\w\-]+|\+[\w\-]+|[\w\-]+)', bio_text)
         for token in bio_tg_links:
             try:
-                resolved_entity = await client.get_entity(token)
+                resolved_entity = await client.get_entity(f"https://t.me/{token}")
                 if resolved_entity.id == current_channel_id:
                     valid_extracted_link = f"https://t.me/{token}"
                     break
             except Exception:
                 continue
 
-    # 🔥 MAIN FIX: BIO FALLBACK LOGIC 
+    # FINAL FALLBACK LOGIC
     if valid_extracted_link:
         return True, valid_extracted_link
         
-    # Agar link na mile aur bio me kuch likha ho to seedha poora bio daal do
     if bio_text and len(bio_text.strip()) > 0:
         return True, bio_text.strip()
         
-    # Agar bio bhi khali hai to username
     if current_username:
         return True, f"https://t.me/{current_username}"
         
@@ -273,7 +288,6 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']}  {v['total_joins']} join")
                 
-        # 🔥 MAIN FIX: LIMIT 10-10 CHANNELS
         hot_display = "\n".join(hot_list[:10]) or "No Hot Channels Yet."
         cold_display = "\n".join(cold_list[:10]) or "No Cold Channels Yet."
         
@@ -338,7 +352,6 @@ async def run_cross_loop(source_msg, event):
             # VERIFY LINKS
             is_safe, target_link = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
 
-            # 🔥 MAIN FIX: SILENT RETRY/SKIP (No spamming in saved messages)
             if not is_safe or not target_link or target_link == "SKIP_DROP":
                 current_retries = retry_count.get(channel_id, 0)
                 if current_retries < 2:
@@ -352,17 +365,13 @@ async def run_cross_loop(source_msg, event):
             # ----- FORWARD SECTOR (ANTI-SPAM) -----
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             
-            # Forward action
             fwd_msgs = await client.forward_messages(real_entity, source_msg)
             fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
             
-            # Anti-Spam Micro Delay 
             await asyncio.sleep(random.uniform(1.5, 3.8))
             
-            # Drop Action
             drop = None
             if target_link:
-                # Agar fallback me sirf bio mila hai, toh usko as it is daalega, otherwise regular format me.
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
             
@@ -375,7 +384,7 @@ async def run_cross_loop(source_msg, event):
             try: await client.delete_messages(real_entity, fwd.id)
             except: pass
             
-            await asyncio.sleep(random.uniform(0.5, 1.5)) # Anti-Spam Micro Delay
+            await asyncio.sleep(random.uniform(0.5, 1.5)) 
             
             if drop:
                 try: await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
@@ -383,7 +392,6 @@ async def run_cross_loop(source_msg, event):
 
             status_tracker["completed"] += 1
             if CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
-                # Increased Random Sleep to mimic human behavior
                 await asyncio.sleep(random.randint(20, 45))
             
         except errors.FloodWaitError as e:
@@ -401,7 +409,6 @@ async def run_cross_loop(source_msg, event):
     CROSS_LOOP_RUNNING = False
     status_tracker["current_channel"] = "None"
     
-    # Send final summary at the end
     summary_text = (
         f"✅ **Silent Automation Loop Completed!**\n\n"
         f"📊 **Final Summary:**\n"
