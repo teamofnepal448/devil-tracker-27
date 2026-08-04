@@ -11,14 +11,11 @@ import json
 from datetime import datetime
 from quart import Quart
 
-# Supabase upgrade ke liye (pip install supabase)
-# from supabase import create_client, Client 
-
 app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V5.0: Multi-Cross & Anti-Cheat Active!"
+    return "Official IPL Titan Live Join-Tracker V5.1: Status & Link Extraction Fixed!"
 
 # ========================================================
 # CONFIGURATION
@@ -28,11 +25,6 @@ api_hash = "ff6eee1bcccf82daea88c63c45b6b546"
 SESSION_STRING = os.environ.get("SESSION_STRING", None)
 TARGET_MAIN_CHANNEL = -1002413253133 # DEVIL PREDICTION (Main)
 FOLDER_TARGET_NAME = "RAN X CROXX"
-
-# DATABASE SETUP (Ready for Supabase Migration)
-# SUPABASE_URL = "your_supabase_url"
-# SUPABASE_KEY = "your_supabase_key"
-# supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 if os.path.exists("/data"):
     DB_FILE = "/data/devil_analytics.json"
@@ -47,7 +39,7 @@ else:
 CROSS_LOOP_RUNNING = False
 MEMORY_CACHE = {}
 CHANNELS_QUEUE = [] 
-CROSS_SOURCE_MSGS = [] # Store multi-messages
+CROSS_SOURCE_MSGS = [] 
 
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
@@ -110,50 +102,55 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# UPGRADE 1: ADVANCED LINK DETECTOR (Fixed Forward Bugs)
+# BUG FIX 2: AGGRESSIVE LINK DETECTOR
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
-    current_channel_id = current_channel_entity.id
     current_username = getattr(current_channel_entity, 'username', '')
-    current_username_lower = current_username.lower().strip() if current_username else "___none___"
-
+    
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo"]
-    post_text = " "
+    # Bio ko bhi posts ke text ke sath jod do scan karne ke liye
+    post_text = (bio_text or "") + " "
 
     for msg in messages_list:
-        # Use raw_text to extract all visible text including forwards
         if msg.raw_text:
             post_text += msg.raw_text + " "
             if any(word in msg.raw_text.lower() for word in blacklist_words):
                 return False, None
         
-        # Check hidden URLs in text formatting (Hyperlinks in forwarded messages)
         if msg.entities:
             for ent, txt in msg.get_entities_text():
                 if isinstance(ent, MessageEntityTextUrl):
                     post_text += ent.url + " "
 
-    post_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', post_text)
-    post_mentions = re.findall(r'@([\w\-]+)', post_text)
-    post_tokens = list(set(post_tg_links + post_mentions))
+    # Aggressive Regex: Har tarah ki t.me links (public, private +, joinchat) pakdega
+    all_links = re.findall(r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?[\w\-]+', post_text)
+    
+    # @mentions ko bhi link banake list me daal do
+    mentions = re.findall(r'@([\w\-]+)', post_text)
+    for m in mentions:
+        all_links.append(f"https://t.me/{m}")
 
-    valid_extracted_link = None
-    for token in post_tokens:
-        token_clean = token.lower().strip()
-        if "devil" in token_clean or "titan" in token_clean or "bot" in token_clean or token_clean == current_username_lower:
+    target_link = None
+    for link in all_links:
+        link_lower = link.lower()
+        # Apni links ko filter kar do
+        if "devil" in link_lower or "titan" in link_lower or "bot" in link_lower:
             continue
-        try:
-            resolved_entity = await client.get_entity(token)
-            if isinstance(resolved_entity, User): continue
-            if resolved_entity.id == current_channel_id:
-                valid_extracted_link = f"https://t.me/{token}"
-                break
-        except Exception:
-            continue
+        
+        # Link ko sahi URL format me set karna
+        if not link_lower.startswith("http"):
+            link = "https://" + link.replace("@", "")
+            
+        target_link = link
+        break # Pehli valid link milte hi loop break
 
-    if valid_extracted_link: return True, valid_extracted_link
-    if bio_text and len(bio_text.strip()) > 0: return True, bio_text.strip()
-    if current_username: return True, f"https://t.me/{current_username}"
+    # Fallback 1: Agar posts ya bio me link nahi mili, par public channel hai toh username uthao
+    if not target_link and current_username:
+        target_link = f"https://t.me/{current_username}"
+        
+    if target_link:
+        return True, target_link
+        
     return True, "SKIP_DROP"
 
 # ========================================================
@@ -197,11 +194,8 @@ async def controller(event):
 
         reply_msg = await event.get_reply_message()
         
-        # UPGRADE 2: MULTI-CROSS CAPTURE
-        # Capture main message + next 2 messages (like the 3 Devil Manager messages in your screenshot)
         CROSS_SOURCE_MSGS = [reply_msg]
         try:
-            # Fetch messages that come immediately after the replied message
             next_msgs = await client.get_messages(event.chat_id, min_id=reply_msg.id, limit=2, reverse=True)
             for m in next_msgs:
                 CROSS_SOURCE_MSGS.append(m)
@@ -233,6 +227,21 @@ async def controller(event):
         CROSS_LOOP_RUNNING = False
         save_queue_state(CHANNELS_QUEUE)
         await event.reply("🛑 Loop rok diya gaya hai.")
+        
+    # ========================================================
+    # BUG FIX 1: /STATUS COMMAND ADDED HERE
+    # ========================================================
+    elif text == "/status":
+        msg = (
+            f"📊 **Cross-Promo Live Status:**\n\n"
+            f"🔹 **Total Channels in Folder:** {status_tracker['total']}\n"
+            f"✅ **Completed Targets:** {status_tracker['completed']}\n"
+            f"⏭ **Skipped (No Link/Blacklisted):** {status_tracker['skipped']}\n"
+            f"⏳ **Remaining in Queue:** {status_tracker['remaining']}\n"
+            f"📍 **Currently Processing:** {status_tracker['current_channel']}\n\n"
+            f"🔄 **Engine Running:** {'Yes 🟢' if CROSS_LOOP_RUNNING else 'No 🔴'}"
+        )
+        await event.reply(msg)
 
 # ========================================================
 # CORE AUTOMATION ENGINE 
@@ -259,7 +268,6 @@ async def run_cross_loop():
 
             status_tracker["current_channel"] = real_entity.title
             
-            # Scan recent messages
             messages_to_scan = []
             async for last_msg in client.iter_messages(real_entity, limit=3):
                 messages_to_scan.append(last_msg)
@@ -284,9 +292,6 @@ async def run_cross_loop():
 
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             
-            # -----------------------------------------------------
-            # UPGRADE 2: MULTI-POST EXECUTION WITH CUSTOM DELAYS
-            # -----------------------------------------------------
             fwd_ids = []
             for idx, msg_to_send in enumerate(CROSS_SOURCE_MSGS):
                 try:
@@ -294,26 +299,20 @@ async def run_cross_loop():
                     fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
                     fwd_ids.append(fwd.id)
                     
-                    # Custom Delay Logic
                     if idx == 0 and len(CROSS_SOURCE_MSGS) > 1:
-                        await asyncio.sleep(120)  # Wait 2 mins after main post
+                        await asyncio.sleep(120)  
                     elif idx == 1 and len(CROSS_SOURCE_MSGS) > 2:
-                        await asyncio.sleep(60)   # Wait 1 min after second post
+                        await asyncio.sleep(60)   
                 except Exception as e:
                     print(f"Error forwarding multi-post part {idx}: {e}")
 
             await asyncio.sleep(random.uniform(1.5, 3.8))
 
-            # Send the Drop Link
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
-            # -----------------------------------------------------
-            # UPGRADE 3: CROSS DELETION SYNC (ANTI-CHEAT)
-            # -----------------------------------------------------
-            # Wait for 5 mins (300 secs), but check every 15 secs if they deleted our post early
             wait_time = 300
             check_interval = 15
             early_deleted = False
@@ -322,7 +321,6 @@ async def run_cross_loop():
                 await asyncio.sleep(check_interval)
                 if not CROSS_LOOP_RUNNING: break
                 
-                # Check if the FIRST main forwarded message still exists in their channel
                 if fwd_ids:
                     try:
                         check_msgs = await client.get_messages(real_entity, ids=[fwd_ids[0]])
@@ -330,31 +328,26 @@ async def run_cross_loop():
                             early_deleted = True
                             break
                     except Exception:
-                        pass # Ignore fetch errors temporarily
+                        pass
 
-            # Calculate joins
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             update_joins_score(channel_id, real_entity.title, after_joins - before_joins)
 
-            # Cleanup Phase
             if early_deleted:
                 print(f"🚨 {real_entity.title} ne jaldi delete kiya! Apni link remove kar raha hu.")
             
-            # Delete our forwarded messages from their channel
             for f_id in fwd_ids:
                 try: await client.delete_messages(real_entity, f_id)
                 except: pass
 
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
-            # Delete their link from our DEVIL main channel
             if drop:
                 try: await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
                 except: pass
 
             status_tracker["completed"] += 1
             if CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
-                # Early delete hua hai toh next channel jaldi pakdo, warna standard rest
                 sleep_time = random.randint(5, 10) if early_deleted else random.randint(20, 45)
                 await asyncio.sleep(sleep_time)
 
@@ -377,3 +370,4 @@ async def startup(): await client.start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
+    
