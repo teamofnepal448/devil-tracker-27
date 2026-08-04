@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V5.1: Status & Link Extraction Fixed!"
+    return "Official IPL Titan Live Join-Tracker V5.2: Instant Dual-Drop Sync Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -102,13 +102,11 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# BUG FIX 2: AGGRESSIVE LINK DETECTOR
+# LINK EXTRACTION ENGINE
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     current_username = getattr(current_channel_entity, 'username', '')
-    
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo"]
-    # Bio ko bhi posts ke text ke sath jod do scan karne ke liye
     post_text = (bio_text or "") + " "
 
     for msg in messages_list:
@@ -122,10 +120,7 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
                 if isinstance(ent, MessageEntityTextUrl):
                     post_text += ent.url + " "
 
-    # Aggressive Regex: Har tarah ki t.me links (public, private +, joinchat) pakdega
     all_links = re.findall(r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?[\w\-]+', post_text)
-    
-    # @mentions ko bhi link banake list me daal do
     mentions = re.findall(r'@([\w\-]+)', post_text)
     for m in mentions:
         all_links.append(f"https://t.me/{m}")
@@ -133,18 +128,15 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     target_link = None
     for link in all_links:
         link_lower = link.lower()
-        # Apni links ko filter kar do
         if "devil" in link_lower or "titan" in link_lower or "bot" in link_lower:
             continue
         
-        # Link ko sahi URL format me set karna
         if not link_lower.startswith("http"):
             link = "https://" + link.replace("@", "")
             
         target_link = link
-        break # Pehli valid link milte hi loop break
+        break
 
-    # Fallback 1: Agar posts ya bio me link nahi mili, par public channel hai toh username uthao
     if not target_link and current_username:
         target_link = f"https://t.me/{current_username}"
         
@@ -227,10 +219,7 @@ async def controller(event):
         CROSS_LOOP_RUNNING = False
         save_queue_state(CHANNELS_QUEUE)
         await event.reply("🛑 Loop rok diya gaya hai.")
-        
-    # ========================================================
-    # BUG FIX 1: /STATUS COMMAND ADDED HERE
-    # ========================================================
+
     elif text == "/status":
         msg = (
             f"📊 **Cross-Promo Live Status:**\n\n"
@@ -244,7 +233,7 @@ async def controller(event):
         await event.reply(msg)
 
 # ========================================================
-# CORE AUTOMATION ENGINE 
+# CORE AUTOMATION ENGINE (INSTANT DUAL DROP)
 # ========================================================
 async def run_cross_loop():
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE, CROSS_SOURCE_MSGS
@@ -292,27 +281,30 @@ async def run_cross_loop():
 
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             
+            # -----------------------------------------------------
+            # FIX: INSTANT MULTI-FORWARD (NO 2-MIN TIMING GAP)
+            # -----------------------------------------------------
             fwd_ids = []
-            for idx, msg_to_send in enumerate(CROSS_SOURCE_MSGS):
+            for msg_to_send in CROSS_SOURCE_MSGS:
                 try:
                     fwd_msgs = await client.forward_messages(real_entity, msg_to_send)
                     fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
                     fwd_ids.append(fwd.id)
-                    
-                    if idx == 0 and len(CROSS_SOURCE_MSGS) > 1:
-                        await asyncio.sleep(120)  
-                    elif idx == 1 and len(CROSS_SOURCE_MSGS) > 2:
-                        await asyncio.sleep(60)   
+                    await asyncio.sleep(1) # Safety 1-sec gap for Telegram flood control
                 except Exception as e:
-                    print(f"Error forwarding multi-post part {idx}: {e}")
+                    print(f"Error forwarding multi-post part: {e}")
 
-            await asyncio.sleep(random.uniform(1.5, 3.8))
-
+            # -----------------------------------------------------
+            # FIX: INSTANT LINK DROP IN MAIN CHANNEL
+            # -----------------------------------------------------
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
+            # -----------------------------------------------------
+            # 5-MINUTE ANTI-CHEAT MONITORING LOOP
+            # -----------------------------------------------------
             wait_time = 300
             check_interval = 15
             early_deleted = False
@@ -336,6 +328,7 @@ async def run_cross_loop():
             if early_deleted:
                 print(f"🚨 {real_entity.title} ne jaldi delete kiya! Apni link remove kar raha hu.")
             
+            # Cleanup from both sides
             for f_id in fwd_ids:
                 try: await client.delete_messages(real_entity, f_id)
                 except: pass
@@ -370,4 +363,4 @@ async def startup(): await client.start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
-    
+        
