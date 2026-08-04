@@ -2,29 +2,29 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import DialogFilter, PeerChannel, MessageEntityTextUrl
+from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned, User
 import asyncio
 import os
 import re
 import random
 import json
 from datetime import datetime
-import traceback
 from quart import Quart
 
 app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V5.4: Admin-Check & Smart Delay Sync!"
+    return "Official IPL Titan Live Join-Tracker V4.3: Delayed Multi-Cross Active!"
 
 # ========================================================
 # CONFIGURATION
 # ========================================================
 api_id = 36094172
 api_hash = "ff6eee1bcccf82daea88c63c45b6b546"
+
 SESSION_STRING = os.environ.get("SESSION_STRING", None)
-TARGET_MAIN_CHANNEL = -1002413253133 # DEVIL PREDICTION (Main)
+TARGET_MAIN_CHANNEL = -1002413253133 
 FOLDER_TARGET_NAME = "RAN X CROXX"
 
 if os.path.exists("/data"):
@@ -40,24 +40,25 @@ else:
 CROSS_LOOP_RUNNING = False
 MEMORY_CACHE = {}
 CHANNELS_QUEUE = [] 
-CROSS_SOURCE_MSGS = [] 
 
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
 }
 
 # ========================================================
-# STORAGE SYSTEM
+# STORAGE SYSTEM WITH QUEUE PERSISTENCE
 # ========================================================
 def load_analytics():
     global MEMORY_CACHE
-    if MEMORY_CACHE: return MEMORY_CACHE
+    if MEMORY_CACHE:
+        return MEMORY_CACHE
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r") as f:
                 MEMORY_CACHE = json.load(f)
                 return MEMORY_CACHE
-        except Exception: pass
+        except Exception:
+            pass
     return {}
 
 def save_analytics(data):
@@ -68,17 +69,17 @@ def save_analytics(data):
         with open(temp_file, "w") as f:
             json.dump(data, f, indent=4)
         os.replace(temp_file, DB_FILE)
-    except Exception: pass
+    except Exception:
+        pass
 
 def save_queue_state(queue_list):
     db = load_analytics()
-    if isinstance(queue_list, list):
-        db["saved_queue_state"] = queue_list
-        save_analytics(db)
+    db["saved_queue_state"] = queue_list
+    save_analytics(db)
 
 def get_saved_queue_state():
-    state = load_analytics().get("saved_queue_state", [])
-    return state if isinstance(state, list) else []
+    db = load_analytics()
+    return db.get("saved_queue_state", [])
 
 def update_joins_score(channel_id, channel_title, joins_gained):
     db = load_analytics()
@@ -88,6 +89,9 @@ def update_joins_score(channel_id, channel_title, joins_gained):
 
     if ch_key not in db:
         db[ch_key] = {"title": channel_title, "total_joins": 0, "runs": 0, "time_history": []}
+
+    if "time_history" not in db[ch_key]:
+        db[ch_key]["time_history"] = []
 
     db[ch_key]["runs"] += 1
     db[ch_key]["total_joins"] += max(0, joins_gained)
@@ -101,51 +105,73 @@ async def get_current_join_requests(target_channel):
         full_channel = await client(GetFullChannelRequest(target_channel))
         if hasattr(full_channel.full_chat, 'requests_pending'):
             return full_channel.full_chat.requests_pending or 0
-    except: pass
+    except Exception:
+        pass
     return 0
 
 # ========================================================
-# LINK EXTRACTION ENGINE
+# ADVANCED LINK DETECTOR (WITH BIO FALLBACK)
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
+    current_channel_id = current_channel_entity.id
     current_username = getattr(current_channel_entity, 'username', '')
+    current_username_lower = current_username.lower().strip() if current_username else "___none___"
+
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo"]
-    post_text = (bio_text or "") + " "
 
+    post_text = " "
     for msg in messages_list:
-        if msg.raw_text:
-            post_text += msg.raw_text + " "
-            if any(word in msg.raw_text.lower() for word in blacklist_words):
+        if msg.message:
+            post_text += msg.message + " "
+            if any(word in msg.message.lower() for word in blacklist_words):
                 return False, None
-        
-        if msg.entities:
-            for ent, txt in msg.get_entities_text():
-                if isinstance(ent, MessageEntityTextUrl):
-                    post_text += ent.url + " "
 
-    all_links = re.findall(r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?[\w\-]+', post_text)
-    mentions = re.findall(r'@([\w\-]+)', post_text)
-    for m in mentions:
-        all_links.append(f"https://t.me/{m}")
+    post_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', post_text)
+    post_mentions = re.findall(r'@([\w\-]+)', post_text)
+    post_tokens = list(set(post_tg_links + post_mentions))
 
-    target_link = None
-    for link in all_links:
-        link_lower = link.lower()
-        if "devil" in link_lower or "titan" in link_lower or "bot" in link_lower:
+    valid_extracted_link = None
+
+    for token in post_tokens:
+        token_clean = token.lower().strip()
+
+        if "devil" in token_clean or "titan" in token_clean or "bot" in token_clean or token_clean == current_username_lower:
             continue
-        
-        if not link_lower.startswith("http"):
-            link = "https://" + link.replace("@", "")
-            
-        target_link = link
-        break
 
-    if not target_link and current_username:
-        target_link = f"https://t.me/{current_username}"
-        
-    if target_link:
-        return True, target_link
-        
+        try:
+            resolved_entity = await client.get_entity(token)
+            if isinstance(resolved_entity, User):
+                continue
+
+            resolved_id = resolved_entity.id
+            if resolved_id != current_channel_id:
+                return False, None
+            else:
+                if token in post_tg_links:
+                    valid_extracted_link = f"https://t.me/{token}"
+        except Exception:
+            continue
+
+    if not valid_extracted_link and bio_text:
+        bio_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', bio_text)
+        for token in bio_tg_links:
+            try:
+                resolved_entity = await client.get_entity(token)
+                if resolved_entity.id == current_channel_id:
+                    valid_extracted_link = f"https://t.me/{token}"
+                    break
+            except Exception:
+                continue
+
+    if valid_extracted_link:
+        return True, valid_extracted_link
+
+    if bio_text and len(bio_text.strip()) > 0:
+        return True, bio_text.strip()
+
+    if current_username:
+        return True, f"https://t.me/{current_username}"
+
     return True, "SKIP_DROP"
 
 # ========================================================
@@ -167,8 +193,10 @@ async def get_folder_channels_safely(target_name, event):
                             raw_id = None
                             if hasattr(peer, 'channel_id'): raw_id = peer.channel_id
                             elif isinstance(peer, PeerChannel): raw_id = peer.channel_id
-                            if raw_id: channel_ids.append(raw_id)
-    except: pass
+                            if raw_id:
+                                channel_ids.append(raw_id)
+    except Exception:
+        pass
     return list(set(channel_ids))
 
 # ========================================================
@@ -176,93 +204,118 @@ async def get_folder_channels_safely(target_name, event):
 # ========================================================
 @client.on(events.NewMessage(chats='me'))
 async def controller(event):
-    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, CROSS_SOURCE_MSGS
-    
-    if not event.raw_text: return
+    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE
     text = event.raw_text.strip().lower()
 
-    try:
-        if text == "/ping":
-            await event.reply("🟢 **System is Online!** Ready to accept commands.")
+    if text == "/cross start":
+        if not event.is_reply:
+            await event.reply("⚠️ Post par reply karke command do bhai!")
+            return
+        if CROSS_LOOP_RUNNING:
+            await event.reply("⚠️ Loop pehle se chal raha hai!")
+            return
 
-        elif text.startswith("/cross start"):
-            if not event.is_reply:
-                await event.reply("⚠️ Main post par reply karke command do!")
+        reply_msg = await event.get_reply_message()
+        CROSS_LOOP_RUNNING = True
+
+        # MULTI-CROSS CAPTURE
+        source_msgs = [reply_msg]
+        try:
+            next_msgs = await client.get_messages(event.chat_id, min_id=reply_msg.id, limit=2, reverse=True)
+            for m in next_msgs:
+                if m.raw_text and m.raw_text.strip().lower().startswith("/"):
+                    continue
+                source_msgs.append(m)
+        except Exception:
+            pass
+
+        saved_q = get_saved_queue_state()
+        if saved_q:
+            CHANNELS_QUEUE = saved_q
+            await event.reply(f"🔄 **Purana state mila!** Wahi se continue kar raha hu. Remaining: {len(CHANNELS_QUEUE)} channels.")
+        else:
+            channels = await get_folder_channels_safely(FOLDER_TARGET_NAME, event)
+            if not channels:
+                await event.reply(f"❌ Folder '{FOLDER_TARGET_NAME}' khali mila!")
+                CROSS_LOOP_RUNNING = False
                 return
-            if CROSS_LOOP_RUNNING:
-                await event.reply("⚠️ Loop pehle se chal raha hai!")
-                return
+            random.shuffle(channels)
+            db = load_analytics()
+            channels.sort(key=lambda c: db.get(str(c), {}).get("total_joins", 0), reverse=True)
+            CHANNELS_QUEUE = list(channels)
 
-            reply_msg = await event.get_reply_message()
-            CROSS_SOURCE_MSGS = [reply_msg]
-            
-            try:
-                next_msgs = await client.get_messages(event.chat_id, min_id=reply_msg.id, limit=2, reverse=True)
-                for m in next_msgs:
-                    if m.raw_text and m.raw_text.startswith("/"): continue
-                    CROSS_SOURCE_MSGS.append(m)
-            except Exception as e:
-                await event.reply(f"⚠️ Multi-fetch warning: {e}")
+            status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
+            await event.reply(f"🚀 **Delayed Multi-Cross Engine Enabled.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
 
-            CROSS_LOOP_RUNNING = True
-            saved_q = get_saved_queue_state()
-            
-            if saved_q and len(saved_q) > 0:
-                CHANNELS_QUEUE = saved_q
-                await event.reply(f"🔄 **Purana state mila!** Remaining: {len(CHANNELS_QUEUE)} channels.")
+        asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
+
+    elif text == "/cross stop":
+        CROSS_LOOP_RUNNING = False
+        save_queue_state(CHANNELS_QUEUE)
+        await event.reply("🛑 Loop rok diya gaya hai. Current progress save kar li gayi hai.")
+
+    elif text == "/cross reset":
+        save_queue_state([])
+        CHANNELS_QUEUE = []
+        CROSS_LOOP_RUNNING = False
+        status_tracker.update({"total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"})
+        await event.reply("🔄 Queue Reset completed!")
+
+    elif text == "/status":
+        db = load_analytics()
+        sorted_channels = [item for item in db.items() if item[0] != "saved_queue_state"]
+        sorted_channels = sorted(sorted_channels, key=lambda x: x[1].get("total_joins", 0), reverse=True)
+
+        hot_list, cold_list = [], []
+        for k, v in sorted_channels:
+            history = v.get("time_history", [])
+            time_log = ""
+            if history:
+                best_run = max(history, key=lambda x: x["joins"])
+                if best_run["joins"] > 0:
+                    time_log = f" (Peak: +{best_run['joins']} at {best_run['hour']})"
+
+            display_text = f"• {v['title']} +{v['total_joins']} joins{time_log}"
+            if v["total_joins"] > 2:
+                hot_list.append(display_text)
             else:
-                channels = await get_folder_channels_safely(FOLDER_TARGET_NAME, event)
-                if not channels:
-                    await event.reply(f"❌ Folder '{FOLDER_TARGET_NAME}' khali mila!")
-                    CROSS_LOOP_RUNNING = False
-                    return
-                random.shuffle(channels)
-                db = load_analytics()
-                channels.sort(key=lambda c: db.get(str(c), {}).get("total_joins", 0), reverse=True)
-                CHANNELS_QUEUE = list(channels)
+                cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
-                status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE)})
-                await event.reply(f"🚀 **Multi-Cross Engine Enabled.** Processing {len(CHANNELS_QUEUE)} channels...")
+        hot_display = "\n".join(hot_list[:10]) or "No Hot Channels Yet."
+        cold_display = "\n".join(cold_list[:10]) or "No Cold Channels Yet."
 
-            asyncio.create_task(run_cross_loop())
-
-        elif text.startswith("/cross stop"):
-            CROSS_LOOP_RUNNING = False
-            save_queue_state(CHANNELS_QUEUE)
-            await event.reply("🛑 Loop rok diya gaya hai. State saved.")
-
-        elif text.startswith("/status"):
-            msg = (
-                f"📊 **Cross-Promo Live Status:**\n\n"
-                f"🔹 **Total Channels in Folder:** {status_tracker['total']}\n"
-                f"✅ **Completed Targets:** {status_tracker['completed']}\n"
-                f"⏭ **Skipped (No Admin/Blacklisted):** {status_tracker['skipped']}\n"
-                f"⏳ **Remaining in Queue:** {status_tracker['remaining']}\n"
-                f"📍 **Currently Processing:** {status_tracker['current_channel']}\n\n"
-                f"🔄 **Engine Running:** {'Yes 🟢' if CROSS_LOOP_RUNNING else 'No 🔴'}"
-            )
-            await event.reply(msg)
-
-    except Exception as e:
-        error_trace = traceback.format_exc()
-        await event.reply(f"❌ **System Error Handled:**\n`{str(e)}`")
+        status_text = (
+            f"📊 **DEVIL LIVE TRACKER STATUS**\n\n"
+            f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
+            f"• Processed: {status_tracker['completed']} / {status_tracker['total']}\n"
+            f"• Skipped: {status_tracker['skipped']}\n"
+            f"• Remaining: {status_tracker['remaining']}\n"
+            f"• Current Focus: **{status_tracker['current_channel']}**\n\n"
+            f"🔥 **HOT ZONE (Top 10 Gainers)**\n{hot_display}\n\n"
+            f"❄️ **COLD ZONE (Bottom 10 Channels)**\n{cold_display}"
+        )
+        await event.reply(status_text)
 
 # ========================================================
-# CORE AUTOMATION ENGINE (WITH ADMIN CHECK & 1-3 MIN DELAY)
+# CORE AUTOMATION ENGINE (MULTI-CROSS WITH RANDOM DELAY)
 # ========================================================
-async def run_cross_loop():
-    global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE, CROSS_SOURCE_MSGS
+async def run_cross_loop(source_msgs, event):
+    global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
+
+    status_tracker.update({"total": len(CHANNELS_QUEUE) + status_tracker['completed'], "remaining": len(CHANNELS_QUEUE)})
     retry_count = {}
 
     while CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
         save_queue_state(CHANNELS_QUEUE) 
+
         channel_id = CHANNELS_QUEUE.pop(0)
         status_tracker["remaining"] = len(CHANNELS_QUEUE)
 
         try:
             strict_id = int(f"-100{channel_id}" if not str(channel_id).startswith("-100") else channel_id)
-            if strict_id == int(TARGET_MAIN_CHANNEL): continue
-            
+            if strict_id == int(TARGET_MAIN_CHANNEL):
+                continue
+
             try:
                 real_entity = await client.get_entity(strict_id)
             except ValueError:
@@ -270,18 +323,27 @@ async def run_cross_loop():
                 status_tracker["completed"] += 1
                 continue
 
-            status_tracker["current_channel"] = real_entity.title
-            
+            ch_title = real_entity.title
+            status_tracker["current_channel"] = ch_title
+
             messages_to_scan = []
-            async for last_msg in client.iter_messages(real_entity, limit=3):
-                messages_to_scan.append(last_msg)
-            
+            try:
+                async for last_msg in client.iter_messages(real_entity, limit=3):
+                    messages_to_scan.append(last_msg)
+                pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=1)
+                if pinned_msgs:
+                    messages_to_scan.append(pinned_msgs[0])
+            except Exception:
+                pass
+
             bio = ""
             try:
                 full_channel = await client(GetFullChannelRequest(real_entity))
                 bio = full_channel.full_chat.about or ""
-            except: pass
+            except Exception:
+                pass
 
+            # VERIFY LINKS
             is_safe, target_link = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
 
             if not is_safe or not target_link or target_link == "SKIP_DROP":
@@ -294,94 +356,56 @@ async def run_cross_loop():
                     status_tracker["completed"] += 1
                 continue
 
+            # ----- FORWARD SECTOR (MULTI-FORWARD WITH 1-3 MIN RANDOM DELAY) -----
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            
-            # -----------------------------------------------------
-            # UPGRADE 1: ADMIN RIGHTS CHECK & FORWARDING
-            # -----------------------------------------------------
+
             fwd_ids = []
-            forward_successful = True
-            
-            for msg_to_send in CROSS_SOURCE_MSGS:
+            for idx, msg in enumerate(source_msgs):
                 try:
-                    fwd_msgs = await client.forward_messages(real_entity, msg_to_send)
+                    fwd_msgs = await client.forward_messages(real_entity, msg)
                     fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
                     fwd_ids.append(fwd.id)
-                    await asyncio.sleep(1.5) 
-                except (errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError):
-                    # Admin nahi hai ya msg off hai
-                    forward_successful = False
-                    break
-                except Exception as e:
-                    forward_successful = False
-                    break
 
-            # Agar Admin nahi hain ya forward fail ho gaya, toh loop skip kar do
-            if not forward_successful or not fwd_ids:
-                status_tracker["skipped"] += 1
-                status_tracker["completed"] += 1
-                continue
+                    # Agar multi-post hai, to agle post ke liye 1 se 3 min ka random delay
+                    if idx < len(source_msgs) - 1:
+                        post_delay = random.randint(60, 180)
+                        await asyncio.sleep(post_delay)
+                except Exception:
+                    pass
 
-            # -----------------------------------------------------
-            # UPGRADE 2: 1 to 3 MINUTES RANDOM DELAY & ATTACH TEXT
-            # -----------------------------------------------------
-            # Cross me post hone ke baad main channel drop ke liye 1 se 3 min rukege
-            drop_delay = random.randint(60, 180)
-            await asyncio.sleep(drop_delay)
+            # Anti-Spam Micro Delay 
+            await asyncio.sleep(random.uniform(1.5, 3.8))
 
-            # Ab Text ke sath Link attach karke main channel me dalna
+            # Drop Action
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
-                
-                # Jis post par aapne reply karke command diya tha, usko copy & attach karna
-                template_text = CROSS_SOURCE_MSGS[0].text if CROSS_SOURCE_MSGS[0].text else ""
-                if template_text:
-                    drop_text = f"{template_text}\n\n{drop_text}"
-                    
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
-            # -----------------------------------------------------
-            # 5-MINUTE ANTI-CHEAT MONITORING LOOP
-            # -----------------------------------------------------
-            wait_time = 300
-            check_interval = 15
-            early_deleted = False
-
-            for _ in range(int(wait_time / check_interval)):
-                await asyncio.sleep(check_interval)
-                if not CROSS_LOOP_RUNNING: break
-                
-                if fwd_ids:
-                    try:
-                        check_msgs = await client.get_messages(real_entity, ids=[fwd_ids[0]])
-                        if not check_msgs or check_msgs[0] is None:
-                            early_deleted = True
-                            break
-                    except Exception:
-                        pass
+            await asyncio.sleep(300)
 
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            update_joins_score(channel_id, real_entity.title, after_joins - before_joins)
+            gained = after_joins - before_joins
+            update_joins_score(channel_id, ch_title, gained)
 
-            if early_deleted:
-                pass # Link removed early
-            
-            # Cleanup from both sides
+            # Cleanup forwarded posts
             for f_id in fwd_ids:
-                try: await client.delete_messages(real_entity, f_id)
-                except: pass
+                try:
+                    await client.delete_messages(real_entity, f_id)
+                except Exception:
+                    pass
 
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
             if drop:
-                try: await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
-                except: pass
+                try:
+                    await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
+                except Exception:
+                    pass
 
             status_tracker["completed"] += 1
             if CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
-                sleep_time = random.randint(5, 10) if early_deleted else random.randint(20, 45)
-                await asyncio.sleep(sleep_time)
+                await asyncio.sleep(random.randint(20, 45))
 
         except errors.FloodWaitError as e:
             await asyncio.sleep(e.seconds + 5)
@@ -392,15 +416,24 @@ async def run_cross_loop():
             status_tracker["completed"] += 1
             continue
 
-    if not CHANNELS_QUEUE: save_queue_state([]) 
+    if not CHANNELS_QUEUE:
+        save_queue_state([]) 
+
     CROSS_LOOP_RUNNING = False
-    
-    try:
-        await client.send_message('me', "✅ **Silent Automation Loop Completed!**")
-    except: pass
+    status_tracker["current_channel"] = "None"
+
+    summary_text = (
+        f"✅ **Silent Automation Loop Completed!**\n\n"
+        f"📊 **Final Summary:**\n"
+        f"• Total Channels in Folder: {status_tracker['total']}\n"
+        f"• Successfully Processed: {status_tracker['completed'] - status_tracker['skipped']}\n"
+        f"• Skipped / Third-Party IDs: {status_tracker['skipped']}"
+    )
+    await client.send_message('me', summary_text)
 
 @app.before_serving
-async def startup(): await client.start()
+async def startup():
+    await client.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
