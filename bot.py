@@ -16,7 +16,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V5.3: Crash Protection & Instant Sync!"
+    return "Official IPL Titan Live Join-Tracker V5.4: Admin-Check & Smart Delay Sync!"
 
 # ========================================================
 # CONFIGURATION
@@ -172,7 +172,7 @@ async def get_folder_channels_safely(target_name, event):
     return list(set(channel_ids))
 
 # ========================================================
-# BOT COMMANDS HANDLER (CRASH PROTECTED)
+# BOT COMMANDS HANDLER
 # ========================================================
 @client.on(events.NewMessage(chats='me'))
 async def controller(event):
@@ -199,7 +199,6 @@ async def controller(event):
             try:
                 next_msgs = await client.get_messages(event.chat_id, min_id=reply_msg.id, limit=2, reverse=True)
                 for m in next_msgs:
-                    # Ignore command texts from being forwarded
                     if m.raw_text and m.raw_text.startswith("/"): continue
                     CROSS_SOURCE_MSGS.append(m)
             except Exception as e:
@@ -223,7 +222,7 @@ async def controller(event):
                 CHANNELS_QUEUE = list(channels)
 
                 status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE)})
-                await event.reply(f"🚀 **Multi-Cross Engine Enabled.** (Captured {len(CROSS_SOURCE_MSGS)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
+                await event.reply(f"🚀 **Multi-Cross Engine Enabled.** Processing {len(CHANNELS_QUEUE)} channels...")
 
             asyncio.create_task(run_cross_loop())
 
@@ -237,7 +236,7 @@ async def controller(event):
                 f"📊 **Cross-Promo Live Status:**\n\n"
                 f"🔹 **Total Channels in Folder:** {status_tracker['total']}\n"
                 f"✅ **Completed Targets:** {status_tracker['completed']}\n"
-                f"⏭ **Skipped (No Link/Blacklisted):** {status_tracker['skipped']}\n"
+                f"⏭ **Skipped (No Admin/Blacklisted):** {status_tracker['skipped']}\n"
                 f"⏳ **Remaining in Queue:** {status_tracker['remaining']}\n"
                 f"📍 **Currently Processing:** {status_tracker['current_channel']}\n\n"
                 f"🔄 **Engine Running:** {'Yes 🟢' if CROSS_LOOP_RUNNING else 'No 🔴'}"
@@ -246,11 +245,10 @@ async def controller(event):
 
     except Exception as e:
         error_trace = traceback.format_exc()
-        await event.reply(f"❌ **System Error Handled:**\n`{str(e)}`\nCheck server logs for full trace.")
-        print(error_trace)
+        await event.reply(f"❌ **System Error Handled:**\n`{str(e)}`")
 
 # ========================================================
-# CORE AUTOMATION ENGINE (INSTANT DUAL DROP)
+# CORE AUTOMATION ENGINE (WITH ADMIN CHECK & 1-3 MIN DELAY)
 # ========================================================
 async def run_cross_loop():
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE, CROSS_SOURCE_MSGS
@@ -298,24 +296,54 @@ async def run_cross_loop():
 
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             
-            # INSTANT MULTI-FORWARD
+            # -----------------------------------------------------
+            # UPGRADE 1: ADMIN RIGHTS CHECK & FORWARDING
+            # -----------------------------------------------------
             fwd_ids = []
+            forward_successful = True
+            
             for msg_to_send in CROSS_SOURCE_MSGS:
                 try:
                     fwd_msgs = await client.forward_messages(real_entity, msg_to_send)
                     fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
                     fwd_ids.append(fwd.id)
                     await asyncio.sleep(1.5) 
+                except (errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError):
+                    # Admin nahi hai ya msg off hai
+                    forward_successful = False
+                    break
                 except Exception as e:
-                    print(f"Error forwarding multi-post part: {e}")
+                    forward_successful = False
+                    break
 
-            # INSTANT LINK DROP IN MAIN CHANNEL
+            # Agar Admin nahi hain ya forward fail ho gaya, toh loop skip kar do
+            if not forward_successful or not fwd_ids:
+                status_tracker["skipped"] += 1
+                status_tracker["completed"] += 1
+                continue
+
+            # -----------------------------------------------------
+            # UPGRADE 2: 1 to 3 MINUTES RANDOM DELAY & ATTACH TEXT
+            # -----------------------------------------------------
+            # Cross me post hone ke baad main channel drop ke liye 1 se 3 min rukege
+            drop_delay = random.randint(60, 180)
+            await asyncio.sleep(drop_delay)
+
+            # Ab Text ke sath Link attach karke main channel me dalna
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
+                
+                # Jis post par aapne reply karke command diya tha, usko copy & attach karna
+                template_text = CROSS_SOURCE_MSGS[0].text if CROSS_SOURCE_MSGS[0].text else ""
+                if template_text:
+                    drop_text = f"{template_text}\n\n{drop_text}"
+                    
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
+            # -----------------------------------------------------
             # 5-MINUTE ANTI-CHEAT MONITORING LOOP
+            # -----------------------------------------------------
             wait_time = 300
             check_interval = 15
             early_deleted = False
@@ -337,7 +365,7 @@ async def run_cross_loop():
             update_joins_score(channel_id, real_entity.title, after_joins - before_joins)
 
             if early_deleted:
-                print(f"🚨 {real_entity.title} ne jaldi delete kiya! Apni link remove kar raha hu.")
+                pass # Link removed early
             
             # Cleanup from both sides
             for f_id in fwd_ids:
