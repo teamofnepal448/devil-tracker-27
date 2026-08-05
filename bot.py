@@ -1,4 +1,3 @@
-            
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetDialogFiltersRequest
@@ -111,7 +110,7 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# UPGRADED 4-STAGE LINK DETECTOR ENGINE
+# UPGRADED 5-STAGE LINK DETECTOR ENGINE
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     current_channel_id = current_channel_entity.id
@@ -204,6 +203,11 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     if current_username:
         return True, f"https://t.me/{current_username}"
 
+    # STAGE 5: DIRECT BIO DROP FALLBACK (Naya feature)
+    # Agar link nahi mila, toh seedha Bio uthao aur drop maaro
+    if bio_text and len(bio_text.strip()) > 0:
+        return True, bio_text.strip()
+
     return True, "SKIP_DROP"
 
 # ========================================================
@@ -276,7 +280,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Multi-Stage Engine V4.9 with Async Cancel Protection.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
+            await event.reply(f"🚀 **Multi-Stage Engine V4.9 with Bio Fallback.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
 
@@ -411,6 +415,7 @@ async def run_cross_loop(source_msgs, event):
             # STEP 2: INSTANT LINK DROP
             drop = None
             if target_link:
+                # Agar http link hai toh 👉 lagega, agar sidha bio text hai toh waisa hi drop ho jayega
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
