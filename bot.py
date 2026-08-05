@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V4.3: Delayed Multi-Cross Active!"
+    return "Official IPL Titan Live Join-Tracker V4.4: Attached Multi-Cross Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -245,7 +245,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Delayed Multi-Cross Engine Enabled.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
+            await event.reply(f"🚀 **Attached Multi-Cross Engine Enabled.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
 
@@ -297,7 +297,7 @@ async def controller(event):
         await event.reply(status_text)
 
 # ========================================================
-# CORE AUTOMATION ENGINE (MULTI-CROSS WITH RANDOM DELAY)
+# CORE AUTOMATION ENGINE (ATTACHED MULTI-CROSS & INSTANT DROP)
 # ========================================================
 async def run_cross_loop(source_msgs, event):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
@@ -356,39 +356,51 @@ async def run_cross_loop(source_msgs, event):
                     status_tracker["completed"] += 1
                 continue
 
-            # ----- FORWARD SECTOR (MULTI-FORWARD WITH 1-3 MIN RANDOM DELAY) -----
+            # ----- FORWARD SECTOR & LINK DROP -----
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
 
             fwd_ids = []
-            for idx, msg in enumerate(source_msgs):
-                try:
-                    fwd_msgs = await client.forward_messages(real_entity, msg)
-                    fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
-                    fwd_ids.append(fwd.id)
+            first_fwd_id = None
 
-                    # Agar multi-post hai, to agle post ke liye 1 se 3 min ka random delay
-                    if idx < len(source_msgs) - 1:
-                        post_delay = random.randint(60, 180)
-                        await asyncio.sleep(post_delay)
+            # 1. PEHLA MESSAGE CROSS CHANNEL ME FORWARD KARO
+            if source_msgs:
+                try:
+                    fwd_msgs = await client.forward_messages(real_entity, source_msgs[0])
+                    fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
+                    first_fwd_id = fwd.id
+                    fwd_ids.append(first_fwd_id)
                 except Exception:
                     pass
 
-            # Anti-Spam Micro Delay 
+            # Anti-Spam Micro Delay
             await asyncio.sleep(random.uniform(1.5, 3.8))
 
-            # Drop Action
+            # 2. INSTANT LINK DROP (Pehla Post hote hi turant main channel me link dalega)
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
+            # 3. SECONDARY POSTS (Pehle message me REPLY/ATTACH hokar jaenge 1-3 min delay ke baad)
+            if len(source_msgs) > 1 and first_fwd_id:
+                for msg in source_msgs[1:]:
+                    post_delay = random.randint(60, 180) # 1 se 3 minute ka delay
+                    await asyncio.sleep(post_delay)
+                    try:
+                        fwd_msgs = await client.forward_messages(real_entity, msg, reply_to=first_fwd_id)
+                        fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
+                        fwd_ids.append(fwd.id)
+                    except Exception:
+                        pass
+
+            # 4. Standard Tracking Timer (5 Minute Wait)
             await asyncio.sleep(300)
 
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             gained = after_joins - before_joins
             update_joins_score(channel_id, ch_title, gained)
 
-            # Cleanup forwarded posts
+            # 5. Cleanup (Delete all forwarded posts & main channel drop link)
             for f_id in fwd_ids:
                 try:
                     await client.delete_messages(real_entity, f_id)
