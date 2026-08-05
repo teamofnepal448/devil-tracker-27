@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V4.4: Attached Multi-Cross Active!"
+    return "Official IPL Titan Live Join-Tracker V4.5: Fixed Attached Multi-Cross Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -245,7 +245,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Attached Multi-Cross Engine Enabled.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
+            await event.reply(f"🚀 **Attached Multi-Cross Engine V4.5 Enabled.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
 
@@ -381,17 +381,27 @@ async def run_cross_loop(source_msgs, event):
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
-            # 3. SECONDARY POSTS (Pehle message me REPLY/ATTACH hokar jaenge 1-3 min delay ke baad)
+            # 3. SECONDARY POSTS (FIXED: Send Message with reply_to + Fallback)
             if len(source_msgs) > 1 and first_fwd_id:
                 for msg in source_msgs[1:]:
                     post_delay = random.randint(60, 180) # 1 se 3 minute ka delay
                     await asyncio.sleep(post_delay)
                     try:
-                        fwd_msgs = await client.forward_messages(real_entity, msg, reply_to=first_fwd_id)
-                        fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
-                        fwd_ids.append(fwd.id)
+                        # Pehle Attached Reply try karega
+                        if msg.media:
+                            sec_fwd = await client.send_message(real_entity, msg.message or "", file=msg.media, reply_to=first_fwd_id)
+                        else:
+                            sec_fwd = await client.send_message(real_entity, msg.message or "", reply_to=first_fwd_id)
+                        if sec_fwd:
+                            fwd_ids.append(sec_fwd.id)
                     except Exception:
-                        pass
+                        # Fallback: Agar reply nahi le raha to normal forward kar dega
+                        try:
+                            fwd_msgs = await client.forward_messages(real_entity, msg)
+                            sec_fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
+                            fwd_ids.append(sec_fwd.id)
+                        except Exception:
+                            pass
 
             # 4. Standard Tracking Timer (5 Minute Wait)
             await asyncio.sleep(300)
@@ -450,4 +460,3 @@ async def startup():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
-    
