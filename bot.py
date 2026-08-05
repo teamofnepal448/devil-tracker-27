@@ -1,3 +1,4 @@
+            
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetDialogFiltersRequest
@@ -424,7 +425,6 @@ async def run_cross_loop(source_msgs, event):
                     post_delay = random.randint(60, 180)
                     elapsed = 0
                     
-                    # Sleep in 2-sec intervals to instantly catch cancellation
                     while elapsed < post_delay:
                         if stop_secondary_flag.is_set() or not CROSS_LOOP_RUNNING:
                             return
@@ -434,7 +434,6 @@ async def run_cross_loop(source_msgs, event):
                     if stop_secondary_flag.is_set() or not CROSS_LOOP_RUNNING:
                         return
 
-                    # Verify main post is still alive before sending secondary post
                     try:
                         chk = await client.get_messages(real_entity, ids=first_fwd_id)
                         if not chk or getattr(chk, 'empty', False):
@@ -444,7 +443,6 @@ async def run_cross_loop(source_msgs, event):
                         stop_secondary_flag.set()
                         return
 
-                    # Send Secondary Post
                     try:
                         if msg.media:
                             sec_fwd = await client.send_message(real_entity, msg.message or "", file=msg.media, reply_to=first_fwd_id)
@@ -461,12 +459,11 @@ async def run_cross_loop(source_msgs, event):
                         except Exception:
                             pass
 
-            # Start Secondary Task in Background
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
-            # STEP 4: REAL-TIME MONITORING LOOP (10-18 Sec Pulse)
+            # STEP 4: REAL-TIME MONITORING LOOP
             start_monitor_time = asyncio.get_event_loop().time()
-            total_wait_duration = 300  # 5 Minutes total
+            total_wait_duration = 300
             post_deleted_early = False
 
             while (asyncio.get_event_loop().time() - start_monitor_time) < total_wait_duration and CROSS_LOOP_RUNNING:
@@ -481,7 +478,6 @@ async def run_cross_loop(source_msgs, event):
                     post_deleted_early = True
                     break
 
-            # Signal Secondary Worker to STOP immediately
             stop_secondary_flag.set()
             sec_task.cancel()
             try:
@@ -489,14 +485,74 @@ async def run_cross_loop(source_msgs, event):
             except (asyncio.CancelledError, Exception):
                 pass
 
-            # STEP 5: HANDLE EARLY DELETION VS NORMAL COMPLETION
+            # STEP 5: CLEANUP & SHIFT
             if post_deleted_early:
-                # Cancelled path: Main Channel se unka link turant delete karo
                 if drop:
                     try:
                         await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
                     except Exception:
                         pass
 
-                # Cleanup remaining forwarded posts
-            
+                for f_id in fwd_ids:
+                    try:
+                        await client.delete_messages(real_entity, f_id)
+                    except Exception:
+                        pass
+
+                status_tracker["completed"] += 1
+                await asyncio.sleep(random.uniform(10, 18))
+                continue
+
+            after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
+            gained = after_joins - before_joins
+            update_joins_score(channel_id, ch_title, gained)
+
+            for f_id in fwd_ids:
+                try:
+                    await client.delete_messages(real_entity, f_id)
+                except Exception:
+                    pass
+
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+            if drop:
+                try:
+                    await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
+                except Exception:
+                    pass
+
+            status_tracker["completed"] += 1
+            if CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
+                await asyncio.sleep(random.uniform(10, 18))
+
+        except errors.FloodWaitError as e:
+            await asyncio.sleep(e.seconds + 5)
+            CHANNELS_QUEUE.insert(0, channel_id) 
+            continue
+        except Exception:
+            status_tracker["skipped"] += 1
+            status_tracker["completed"] += 1
+            continue
+
+    if not CHANNELS_QUEUE:
+        save_queue_state([]) 
+
+    CROSS_LOOP_RUNNING = False
+    status_tracker["current_channel"] = "None"
+
+    summary_text = (
+        f"✅ **Silent Automation Loop Completed!**\n\n"
+        f"📊 **Final Summary:**\n"
+        f"• Total Channels in Folder: {status_tracker['total']}\n"
+        f"• Successfully Processed: {status_tracker['completed'] - status_tracker['skipped']}\n"
+        f"• Skipped / Third-Party IDs: {status_tracker['skipped']}"
+    )
+    await client.send_message('me', summary_text)
+
+@app.before_serving
+async def startup():
+    await client.start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    app.run(host="0.0.0.0", port=port)
