@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V4.7: Multi-Stage Link Detector & Smart Guard Active!"
+    return "Official IPL Titan Live Join-Tracker V4.9: Async Dynamic Sync Engine Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -165,7 +165,6 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     for raw_link in candidate_links:
         link_lower = raw_link.lower().strip()
 
-        # Ignore self branding & current channel username
         if any(b in link_lower for b in ["devil", "titan", "bot"]) or current_username_lower in link_lower:
             continue
 
@@ -183,7 +182,6 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
                 valid_extracted_link = f"https://t.me/{token}" if raw_link.startswith("http") else raw_link
                 break
             else:
-                # Third party link found -> unsafe cross
                 return False, None
         except Exception:
             continue
@@ -277,7 +275,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Multi-Stage Link Engine V4.7 Enabled.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
+            await event.reply(f"🚀 **Multi-Stage Engine V4.9 with Async Cancel Protection.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
 
@@ -329,7 +327,7 @@ async def controller(event):
         await event.reply(status_text)
 
 # ========================================================
-# CORE AUTOMATION ENGINE
+# CORE AUTOMATION ENGINE (ASYNC CROSS SYNC GUARD)
 # ========================================================
 async def run_cross_loop(source_msgs, event):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
@@ -375,7 +373,6 @@ async def run_cross_loop(source_msgs, event):
             except Exception:
                 pass
 
-            # VERIFY LINKS WITH 4-STAGE ENGINE
             is_safe, target_link = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
 
             if not is_safe or not target_link or target_link == "SKIP_DROP":
@@ -388,7 +385,7 @@ async def run_cross_loop(source_msgs, event):
                     status_tracker["completed"] += 1
                 continue
 
-            # FORWARD & ADMIN POWER CHECK
+            # STEP 1: FORWARD MAIN POST
             fwd_ids = []
             first_fwd_id = None
 
@@ -402,27 +399,52 @@ async def run_cross_loop(source_msgs, event):
                 except Exception:
                     pass
 
-            # IF POST FAILED (NO ADMIN PERMISSION) -> DIRECT SKIP
             if not first_fwd_id:
                 status_tracker["skipped"] += 1
                 status_tracker["completed"] += 1
                 continue
 
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-
             await asyncio.sleep(random.uniform(1.5, 3.8))
 
-            # INSTANT LINK DROP
+            # STEP 2: INSTANT LINK DROP
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
-            # SECONDARY POSTS (Attached Reply)
-            if len(source_msgs) > 1 and first_fwd_id:
+            # STEP 3: PARALLEL SECONDARY POST WORKER (WITH CANCEL FLAG)
+            stop_secondary_flag = asyncio.Event()
+
+            async def send_secondary_posts_task():
+                if len(source_msgs) <= 1:
+                    return
+
                 for msg in source_msgs[1:]:
                     post_delay = random.randint(60, 180)
-                    await asyncio.sleep(post_delay)
+                    elapsed = 0
+                    
+                    # Sleep in 2-sec intervals to instantly catch cancellation
+                    while elapsed < post_delay:
+                        if stop_secondary_flag.is_set() or not CROSS_LOOP_RUNNING:
+                            return
+                        await asyncio.sleep(2)
+                        elapsed += 2
+
+                    if stop_secondary_flag.is_set() or not CROSS_LOOP_RUNNING:
+                        return
+
+                    # Verify main post is still alive before sending secondary post
+                    try:
+                        chk = await client.get_messages(real_entity, ids=first_fwd_id)
+                        if not chk or getattr(chk, 'empty', False):
+                            stop_secondary_flag.set()
+                            return
+                    except Exception:
+                        stop_secondary_flag.set()
+                        return
+
+                    # Send Secondary Post
                     try:
                         if msg.media:
                             sec_fwd = await client.send_message(real_entity, msg.message or "", file=msg.media, reply_to=first_fwd_id)
@@ -434,65 +456,47 @@ async def run_cross_loop(source_msgs, event):
                         try:
                             fwd_msgs = await client.forward_messages(real_entity, msg)
                             sec_fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
-                            fwd_ids.append(sec_fwd.id)
+                            if sec_fwd:
+                                fwd_ids.append(sec_fwd.id)
                         except Exception:
                             pass
 
-            # Wait 5 Minutes Tracking
-            await asyncio.sleep(300)
+            # Start Secondary Task in Background
+            sec_task = asyncio.create_task(send_secondary_posts_task())
 
-            after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            gained = after_joins - before_joins
-            update_joins_score(channel_id, ch_title, gained)
+            # STEP 4: REAL-TIME MONITORING LOOP (10-18 Sec Pulse)
+            start_monitor_time = asyncio.get_event_loop().time()
+            total_wait_duration = 300  # 5 Minutes total
+            post_deleted_early = False
 
-            # Cleanup
-            for f_id in fwd_ids:
+            while (asyncio.get_event_loop().time() - start_monitor_time) < total_wait_duration and CROSS_LOOP_RUNNING:
+                await asyncio.sleep(random.uniform(10, 18))
+
                 try:
-                    await client.delete_messages(real_entity, f_id)
+                    chk_msg = await client.get_messages(real_entity, ids=first_fwd_id)
+                    if not chk_msg or getattr(chk_msg, 'empty', False):
+                        post_deleted_early = True
+                        break
                 except Exception:
-                    pass
+                    post_deleted_early = True
+                    break
 
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+            # Signal Secondary Worker to STOP immediately
+            stop_secondary_flag.set()
+            sec_task.cancel()
+            try:
+                await sec_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
-            if drop:
-                try:
-                    await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
-                except Exception:
-                    pass
+            # STEP 5: HANDLE EARLY DELETION VS NORMAL COMPLETION
+            if post_deleted_early:
+                # Cancelled path: Main Channel se unka link turant delete karo
+                if drop:
+                    try:
+                        await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
+                    except Exception:
+                        pass
 
-            status_tracker["completed"] += 1
-            if CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
-                await asyncio.sleep(random.randint(20, 45))
-
-        except errors.FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 5)
-            CHANNELS_QUEUE.insert(0, channel_id) 
-            continue
-        except Exception:
-            status_tracker["skipped"] += 1
-            status_tracker["completed"] += 1
-            continue
-
-    if not CHANNELS_QUEUE:
-        save_queue_state([]) 
-
-    CROSS_LOOP_RUNNING = False
-    status_tracker["current_channel"] = "None"
-
-    summary_text = (
-        f"✅ **Silent Automation Loop Completed!**\n\n"
-        f"📊 **Final Summary:**\n"
-        f"• Total Channels in Folder: {status_tracker['total']}\n"
-        f"• Successfully Processed: {status_tracker['completed'] - status_tracker['skipped']}\n"
-        f"• Skipped / Third-Party IDs: {status_tracker['skipped']}"
-    )
-    await client.send_message('me', summary_text)
-
-@app.before_serving
-async def startup():
-    await client.start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    app.run(host="0.0.0.0", port=port)
-    
+                # Cleanup remaining forwarded posts
+            
