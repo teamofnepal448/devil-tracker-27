@@ -15,7 +15,7 @@ app = Quart(__name__)
 
 @app.route('/')
 async def home():
-    return "Official IPL Titan Live Join-Tracker V4.5: Fixed Attached Multi-Cross Active!"
+    return "Official IPL Titan Live Join-Tracker V4.6: Smart Post-Verified Multi-Cross Active!"
 
 # ========================================================
 # CONFIGURATION
@@ -245,7 +245,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Attached Multi-Cross Engine V4.5 Enabled.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
+            await event.reply(f"🚀 **Attached Multi-Cross Engine V4.6 Enabled.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...\n(Background Automation Started - Silent Mode)")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
 
@@ -297,7 +297,7 @@ async def controller(event):
         await event.reply(status_text)
 
 # ========================================================
-# CORE AUTOMATION ENGINE (ATTACHED MULTI-CROSS & INSTANT DROP)
+# CORE AUTOMATION ENGINE (SMART POST-VERIFIED & INSTANT DROP)
 # ========================================================
 async def run_cross_loop(source_msgs, event):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
@@ -356,38 +356,45 @@ async def run_cross_loop(source_msgs, event):
                     status_tracker["completed"] += 1
                 continue
 
-            # ----- FORWARD SECTOR & LINK DROP -----
-            before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-
+            # ----- FORWARD SECTOR & STRICT VERIFICATION -----
             fwd_ids = []
             first_fwd_id = None
 
-            # 1. PEHLA MESSAGE CROSS CHANNEL ME FORWARD KARO
+            # 1. PEHLA MESSAGE FORWARD KARO (VERIFICATION CHECK)
             if source_msgs:
                 try:
                     fwd_msgs = await client.forward_messages(real_entity, source_msgs[0])
                     fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
-                    first_fwd_id = fwd.id
-                    fwd_ids.append(first_fwd_id)
+                    if hasattr(fwd, 'id') and fwd.id:
+                        first_fwd_id = fwd.id
+                        fwd_ids.append(first_fwd_id)
                 except Exception:
+                    # Agar admin nahi ho ya post nahi hua, yahan se direct NEXT channel pe chala jayega
                     pass
+
+            # CRITICAL CHECK: Agar Pehla Post nahi gaya (No Admin Power), directly SKIP karo!
+            if not first_fwd_id:
+                status_tracker["skipped"] += 1
+                status_tracker["completed"] += 1
+                continue
+
+            before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
 
             # Anti-Spam Micro Delay
             await asyncio.sleep(random.uniform(1.5, 3.8))
 
-            # 2. INSTANT LINK DROP (Pehla Post hote hi turant main channel me link dalega)
+            # 2. INSTANT LINK DROP (Only when forward success confirmed)
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
-            # 3. SECONDARY POSTS (FIXED: Send Message with reply_to + Fallback)
+            # 3. SECONDARY POSTS (Attached Reply + Fallback)
             if len(source_msgs) > 1 and first_fwd_id:
                 for msg in source_msgs[1:]:
                     post_delay = random.randint(60, 180) # 1 se 3 minute ka delay
                     await asyncio.sleep(post_delay)
                     try:
-                        # Pehle Attached Reply try karega
                         if msg.media:
                             sec_fwd = await client.send_message(real_entity, msg.message or "", file=msg.media, reply_to=first_fwd_id)
                         else:
@@ -395,7 +402,6 @@ async def run_cross_loop(source_msgs, event):
                         if sec_fwd:
                             fwd_ids.append(sec_fwd.id)
                     except Exception:
-                        # Fallback: Agar reply nahi le raha to normal forward kar dega
                         try:
                             fwd_msgs = await client.forward_messages(real_entity, msg)
                             sec_fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
@@ -460,3 +466,4 @@ async def startup():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
+    
