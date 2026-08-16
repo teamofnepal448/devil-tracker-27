@@ -13,6 +13,10 @@ from quart import Quart
 
 app = Quart(__name__)
 
+@app.route('/')
+async def home():
+    return "Official IPL Titan Live Join-Tracker V4.9: Async Dynamic Sync Engine Active!"
+
 # ========================================================
 # CONFIGURATION
 # ========================================================
@@ -40,20 +44,6 @@ CHANNELS_QUEUE = []
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
 }
-
-@app.route('/')
-async def home():
-    return "Official IPL Titan Live Join-Tracker V5.0: Telethon & Uvicorn Connected!"
-
-# ========================================================
-# 🚀 AUTOMATIC TELETHON STARTUP FOR UVICORN
-# ========================================================
-@app.before_serving
-async def start_telegram_bot():
-    print("🔄 Connecting Telethon Client to Telegram...")
-    await client.start()
-    me = await client.get_me()
-    print(f"✅ Telethon Connected Successfully as: {me.first_name} (ID: {me.id})")
 
 # ========================================================
 # STORAGE SYSTEM WITH QUEUE PERSISTENCE
@@ -282,7 +272,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Multi-Stage Engine V5.0 with Bio Fallback.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
+            await event.reply(f"🚀 **Multi-Stage Engine V4.9 with Bio Fallback.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
 
@@ -318,6 +308,7 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
+        # Top 20 Gainers & Bottom 20 Channels
         hot_display = "\n".join(hot_list[:20]) or "No Hot Channels Yet."
         cold_display = "\n".join(cold_list[:20]) or "No Cold Channels Yet."
 
@@ -334,7 +325,7 @@ async def controller(event):
         await event.reply(status_text)
 
 # ========================================================
-# CORE AUTOMATION ENGINE
+# CORE AUTOMATION ENGINE (ASYNC CROSS SYNC GUARD)
 # ========================================================
 async def run_cross_loop(source_msgs, event):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
@@ -392,6 +383,7 @@ async def run_cross_loop(source_msgs, event):
                     status_tracker["completed"] += 1
                 continue
 
+            # STEP 1: FORWARD MAIN POST
             fwd_ids = []
             first_fwd_id = None
 
@@ -413,11 +405,13 @@ async def run_cross_loop(source_msgs, event):
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             await asyncio.sleep(random.uniform(1.5, 3.8))
 
+            # STEP 2: INSTANT LINK DROP
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
+            # STEP 3: PARALLEL SECONDARY POST WORKER
             stop_secondary_flag = asyncio.Event()
 
             async def send_secondary_posts_task():
@@ -464,6 +458,7 @@ async def run_cross_loop(source_msgs, event):
 
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
+            # STEP 4: REAL-TIME MONITORING LOOP
             start_monitor_time = asyncio.get_event_loop().time()
             total_wait_duration = 300
             post_deleted_early = False
@@ -487,6 +482,7 @@ async def run_cross_loop(source_msgs, event):
             except (asyncio.CancelledError, Exception):
                 pass
 
+            # STEP 5: CLEANUP & SHIFT
             if post_deleted_early:
                 if drop:
                     try:
@@ -506,7 +502,7 @@ async def run_cross_loop(source_msgs, event):
 
             status_tracker["completed"] += 1
 
-        except Exception as e:
+        except Exception:
             status_tracker["skipped"] += 1
             status_tracker["completed"] += 1
             continue
