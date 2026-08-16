@@ -13,10 +13,6 @@ from quart import Quart
 
 app = Quart(__name__)
 
-@app.route('/')
-async def home():
-    return "Official IPL Titan Live Join-Tracker V4.9: Async Dynamic Sync Engine Active!"
-
 # ========================================================
 # CONFIGURATION
 # ========================================================
@@ -44,6 +40,20 @@ CHANNELS_QUEUE = []
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
 }
+
+@app.route('/')
+async def home():
+    return "Official IPL Titan Live Join-Tracker V4.9: Async Dynamic Sync Engine Active!"
+
+# ========================================================
+# 🚀 AUTOMATIC TELETHON STARTUP FOR UVICORN
+# ========================================================
+@app.before_serving
+async def start_telegram_bot():
+    print("🔄 Connecting Telethon Client via Uvicorn...")
+    await client.start()
+    me = await client.get_me()
+    print(f"✅ Telethon Connected Successfully: {me.first_name} (ID: {me.id})")
 
 # ========================================================
 # STORAGE SYSTEM WITH QUEUE PERSISTENCE
