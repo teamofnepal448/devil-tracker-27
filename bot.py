@@ -13,8 +13,12 @@ from quart import Quart
 
 app = Quart(__name__)
 
+@app.route('/')
+async def home():
+    return "Official IPL Titan Live Join-Tracker V4.9 (Account 2): Async Dynamic Sync Engine Active!"
+
 # ========================================================
-# CONFIGURATION
+# CONFIGURATION (NEW API CREDENTIALS)
 # ========================================================
 api_id = 36094172
 api_hash = "ff6eee1bcccf82daea88c63c45b6b546"
@@ -23,15 +27,18 @@ SESSION_STRING = os.environ.get("SESSION_STRING", None)
 TARGET_MAIN_CHANNEL = -1002413253133 
 FOLDER_TARGET_NAME = "RAN X CROXX"
 
+# Multi-account isolation: DB path & session name
+DB_FILE_NAME = os.environ.get("DB_FILE_NAME", "devil_analytics_acc2.json")
+
 if os.path.exists("/data"):
-    DB_FILE = "/data/devil_analytics.json"
+    DB_FILE = f"/data/{DB_FILE_NAME}"
 else:
-    DB_FILE = "devil_analytics.json"
+    DB_FILE = DB_FILE_NAME
 
 if SESSION_STRING:
     client = TelegramClient(StringSession(SESSION_STRING.strip()), api_id, api_hash)
 else:
-    client = TelegramClient("devil_main_session", api_id, api_hash)
+    client = TelegramClient("devil_main_session_acc2", api_id, api_hash)
 
 CROSS_LOOP_RUNNING = False
 MEMORY_CACHE = {}
@@ -40,20 +47,6 @@ CHANNELS_QUEUE = []
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
 }
-
-@app.route('/')
-async def home():
-    return "Official IPL Titan Live Join-Tracker V4.9: Async Dynamic Sync Engine Active!"
-
-# ========================================================
-# 🚀 AUTOMATIC TELETHON STARTUP FOR UVICORN
-# ========================================================
-@app.before_serving
-async def start_telegram_bot():
-    print("🔄 Connecting Telethon Client via Uvicorn...")
-    await client.start()
-    me = await client.get_me()
-    print(f"✅ Telethon Connected Successfully: {me.first_name} (ID: {me.id})")
 
 # ========================================================
 # STORAGE SYSTEM WITH QUEUE PERSISTENCE
@@ -235,7 +228,8 @@ async def get_folder_channels_safely(target_name, event):
                                 channel_ids.append(raw_id)
     except Exception:
         pass
-    return list(set(channel_ids))
+    # Yaha par 20 limit set kar di gayi hai (Aapki requirement)
+    return list(set(channel_ids))[:20]
 
 # ========================================================
 # BOT COMMANDS HANDLER
@@ -282,7 +276,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Multi-Stage Engine V4.9 with Bio Fallback.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
+            await event.reply(f"🚀 **Multi-Stage Engine V4.9 (Acc 2).** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
 
@@ -318,24 +312,23 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
-        # Top 20 Gainers & Bottom 20 Channels
-        hot_display = "\n".join(hot_list[:20]) or "No Hot Channels Yet."
-        cold_display = "\n".join(cold_list[:20]) or "No Cold Channels Yet."
+        hot_display = "\n".join(hot_list[:10]) or "No Hot Channels Yet."
+        cold_display = "\n".join(cold_list[:10]) or "No Cold Channels Yet."
 
         status_text = (
-            f"📊 **DEVIL LIVE TRACKER STATUS**\n\n"
+            f"📊 **DEVIL LIVE TRACKER STATUS (Account 2)**\n\n"
             f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
             f"• Processed: {status_tracker['completed']} / {status_tracker['total']}\n"
             f"• Skipped: {status_tracker['skipped']}\n"
             f"• Remaining: {status_tracker['remaining']}\n"
             f"• Current Focus: **{status_tracker['current_channel']}**\n\n"
-            f"🔥 **HOT ZONE (Top 20 Gainers)**\n{hot_display}\n\n"
-            f"❄️ **COLD ZONE (Bottom 20 Channels)**\n{cold_display}"
+            f"🔥 **HOT ZONE (Top 10 Gainers)**\n{hot_display}\n\n"
+            f"❄️ **COLD ZONE (Bottom 10 Channels)**\n{cold_display}"
         )
         await event.reply(status_text)
 
 # ========================================================
-# CORE AUTOMATION ENGINE (ASYNC CROSS SYNC GUARD)
+# CORE AUTOMATION ENGINE
 # ========================================================
 async def run_cross_loop(source_msgs, event):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
@@ -393,7 +386,6 @@ async def run_cross_loop(source_msgs, event):
                     status_tracker["completed"] += 1
                 continue
 
-            # STEP 1: FORWARD MAIN POST
             fwd_ids = []
             first_fwd_id = None
 
@@ -415,13 +407,11 @@ async def run_cross_loop(source_msgs, event):
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             await asyncio.sleep(random.uniform(1.5, 3.8))
 
-            # STEP 2: INSTANT LINK DROP
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
-            # STEP 3: PARALLEL SECONDARY POST WORKER
             stop_secondary_flag = asyncio.Event()
 
             async def send_secondary_posts_task():
@@ -468,10 +458,8 @@ async def run_cross_loop(source_msgs, event):
 
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
-            # STEP 4: REAL-TIME MONITORING LOOP
             start_monitor_time = asyncio.get_event_loop().time()
             total_wait_duration = 300
-            post_deleted_early = False
 
             while (asyncio.get_event_loop().time() - start_monitor_time) < total_wait_duration and CROSS_LOOP_RUNNING:
                 await asyncio.sleep(random.uniform(10, 18))
@@ -479,10 +467,8 @@ async def run_cross_loop(source_msgs, event):
                 try:
                     chk_msg = await client.get_messages(real_entity, ids=first_fwd_id)
                     if not chk_msg or getattr(chk_msg, 'empty', False):
-                        post_deleted_early = True
                         break
                 except Exception:
-                    post_deleted_early = True
                     break
 
             stop_secondary_flag.set()
@@ -492,34 +478,39 @@ async def run_cross_loop(source_msgs, event):
             except (asyncio.CancelledError, Exception):
                 pass
 
-            # STEP 5: CLEANUP & SHIFT
-            if post_deleted_early:
-                if drop:
-                    try:
-                        await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
-                    except Exception:
-                        pass
-
-                for f_id in fwd_ids:
-                    try:
-                        await client.delete_messages(real_entity, f_id)
-                    except Exception:
-                        pass
-
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             joins_gained = max(0, after_joins - before_joins)
             update_joins_score(channel_id, ch_title, joins_gained)
 
+            if drop:
+                try:
+                    await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
+                except Exception:
+                    pass
+
+            for f_id in fwd_ids:
+                try:
+                    await client.delete_messages(real_entity, f_id)
+                except Exception:
+                    pass
+
             status_tracker["completed"] += 1
+            await asyncio.sleep(random.randint(10, 30))
 
         except Exception:
             status_tracker["skipped"] += 1
             status_tracker["completed"] += 1
-            continue
+            await asyncio.sleep(5)
 
-    CROSS_LOOP_RUNNING = False
-    status_tracker["current_channel"] = "Completed"
+# ========================================================
+# 🚀 QUART LIFECYCLE STARTUP HOOK (FOR UVICORN / RENDER)
+# ========================================================
+@app.before_serving
+async def startup():
+    print("🚀 Starting Telegram Client (Acc 2) via Quart Lifecycle...")
+    await client.start()
+    print("✅ Telegram Client Connected Successfully!")
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
