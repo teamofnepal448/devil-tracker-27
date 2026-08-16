@@ -13,10 +13,6 @@ from quart import Quart
 
 app = Quart(__name__)
 
-@app.route('/')
-async def home():
-    return "Official IPL Titan Live Join-Tracker V4.9: Async Dynamic Sync Engine Active!"
-
 # ========================================================
 # CONFIGURATION
 # ========================================================
@@ -44,6 +40,20 @@ CHANNELS_QUEUE = []
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
 }
+
+@app.route('/')
+async def home():
+    return "Official IPL Titan Live Join-Tracker V5.0: Telethon & Uvicorn Connected!"
+
+# ========================================================
+# 🚀 AUTOMATIC TELETHON STARTUP FOR UVICORN
+# ========================================================
+@app.before_serving
+async def start_telegram_bot():
+    print("🔄 Connecting Telethon Client to Telegram...")
+    await client.start()
+    me = await client.get_me()
+    print(f"✅ Telethon Connected Successfully as: {me.first_name} (ID: {me.id})")
 
 # ========================================================
 # STORAGE SYSTEM WITH QUEUE PERSISTENCE
@@ -119,21 +129,18 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
 
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo"]
 
-    # Blacklist Guard Check
     for msg in messages_list:
         if msg.message and any(word in msg.message.lower() for word in blacklist_words):
             return False, None
 
     candidate_links = []
 
-    # STAGE 1: Hidden Telegram URLs (MessageEntityTextUrl)
     for msg in messages_list:
         if msg.entities:
             for entity in msg.entities:
                 if isinstance(entity, MessageEntityTextUrl) and entity.url:
                     candidate_links.append(entity.url)
 
-    # STAGE 2: Inline Button URLs (reply_markup / Keyboard buttons)
     if not candidate_links:
         for msg in messages_list:
             if hasattr(msg, 'reply_markup') and msg.reply_markup:
@@ -146,7 +153,6 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
                 except Exception:
                     pass
 
-    # STAGE 3: Raw Text / Caption Regex
     if not candidate_links:
         post_text = " "
         for msg in messages_list:
@@ -160,7 +166,6 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
         for token in list(set(raw_tg_links + raw_mentions)):
             candidate_links.append(f"https://t.me/{token}")
 
-    # RESOLVE & VERIFY CANDIDATE LINKS
     valid_extracted_link = None
     for raw_link in candidate_links:
         link_lower = raw_link.lower().strip()
@@ -189,7 +194,6 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     if valid_extracted_link:
         return True, valid_extracted_link
 
-    # STAGE 4: Fallback (Bio or Channel Username)
     if bio_text:
         bio_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', bio_text)
         for token in bio_tg_links:
@@ -203,7 +207,6 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     if current_username:
         return True, f"https://t.me/{current_username}"
 
-    # STAGE 5: DIRECT BIO DROP FALLBACK
     if bio_text and len(bio_text.strip()) > 0:
         return True, bio_text.strip()
 
@@ -279,7 +282,7 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Multi-Stage Engine V4.9 with Bio Fallback.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
+            await event.reply(f"🚀 **Multi-Stage Engine V5.0 with Bio Fallback.** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
 
@@ -315,7 +318,6 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
-        # UPDATED TO TOP 20 INSTEAD OF TOP 10
         hot_display = "\n".join(hot_list[:20]) or "No Hot Channels Yet."
         cold_display = "\n".join(cold_list[:20]) or "No Cold Channels Yet."
 
@@ -332,7 +334,7 @@ async def controller(event):
         await event.reply(status_text)
 
 # ========================================================
-# CORE AUTOMATION ENGINE (ASYNC CROSS SYNC GUARD)
+# CORE AUTOMATION ENGINE
 # ========================================================
 async def run_cross_loop(source_msgs, event):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
@@ -390,7 +392,6 @@ async def run_cross_loop(source_msgs, event):
                     status_tracker["completed"] += 1
                 continue
 
-            # STEP 1: FORWARD MAIN POST
             fwd_ids = []
             first_fwd_id = None
 
@@ -412,13 +413,11 @@ async def run_cross_loop(source_msgs, event):
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             await asyncio.sleep(random.uniform(1.5, 3.8))
 
-            # STEP 2: INSTANT LINK DROP
             drop = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
-            # STEP 3: PARALLEL SECONDARY POST WORKER
             stop_secondary_flag = asyncio.Event()
 
             async def send_secondary_posts_task():
@@ -465,7 +464,6 @@ async def run_cross_loop(source_msgs, event):
 
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
-            # STEP 4: REAL-TIME MONITORING LOOP
             start_monitor_time = asyncio.get_event_loop().time()
             total_wait_duration = 300
             post_deleted_early = False
@@ -489,7 +487,6 @@ async def run_cross_loop(source_msgs, event):
             except (asyncio.CancelledError, Exception):
                 pass
 
-            # STEP 5: CLEANUP & SHIFT
             if post_deleted_early:
                 if drop:
                     try:
