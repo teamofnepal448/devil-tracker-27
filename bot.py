@@ -203,8 +203,7 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     if current_username:
         return True, f"https://t.me/{current_username}"
 
-    # STAGE 5: DIRECT BIO DROP FALLBACK (Naya feature)
-    # Agar link nahi mila, toh seedha Bio uthao aur drop maaro
+    # STAGE 5: DIRECT BIO DROP FALLBACK
     if bio_text and len(bio_text.strip()) > 0:
         return True, bio_text.strip()
 
@@ -316,8 +315,9 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
-        hot_display = "\n".join(hot_list[:10]) or "No Hot Channels Yet."
-        cold_display = "\n".join(cold_list[:10]) or "No Cold Channels Yet."
+        # UPDATED TO TOP 20 INSTEAD OF TOP 10
+        hot_display = "\n".join(hot_list[:20]) or "No Hot Channels Yet."
+        cold_display = "\n".join(cold_list[:20]) or "No Cold Channels Yet."
 
         status_text = (
             f"📊 **DEVIL LIVE TRACKER STATUS**\n\n"
@@ -326,8 +326,8 @@ async def controller(event):
             f"• Skipped: {status_tracker['skipped']}\n"
             f"• Remaining: {status_tracker['remaining']}\n"
             f"• Current Focus: **{status_tracker['current_channel']}**\n\n"
-            f"🔥 **HOT ZONE (Top 10 Gainers)**\n{hot_display}\n\n"
-            f"❄️ **COLD ZONE (Bottom 10 Channels)**\n{cold_display}"
+            f"🔥 **HOT ZONE (Top 20 Gainers)**\n{hot_display}\n\n"
+            f"❄️ **COLD ZONE (Bottom 20 Channels)**\n{cold_display}"
         )
         await event.reply(status_text)
 
@@ -415,11 +415,10 @@ async def run_cross_loop(source_msgs, event):
             # STEP 2: INSTANT LINK DROP
             drop = None
             if target_link:
-                # Agar http link hai toh 👉 lagega, agar sidha bio text hai toh waisa hi drop ho jayega
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
 
-            # STEP 3: PARALLEL SECONDARY POST WORKER (WITH CANCEL FLAG)
+            # STEP 3: PARALLEL SECONDARY POST WORKER
             stop_secondary_flag = asyncio.Event()
 
             async def send_secondary_posts_task():
@@ -504,60 +503,20 @@ async def run_cross_loop(source_msgs, event):
                     except Exception:
                         pass
 
-                status_tracker["completed"] += 1
-                await asyncio.sleep(random.uniform(10, 18))
-                continue
-
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            gained = after_joins - before_joins
-            update_joins_score(channel_id, ch_title, gained)
-
-            for f_id in fwd_ids:
-                try:
-                    await client.delete_messages(real_entity, f_id)
-                except Exception:
-                    pass
-
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-
-            if drop:
-                try:
-                    await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
-                except Exception:
-                    pass
+            joins_gained = max(0, after_joins - before_joins)
+            update_joins_score(channel_id, ch_title, joins_gained)
 
             status_tracker["completed"] += 1
-            if CHANNELS_QUEUE and CROSS_LOOP_RUNNING:
-                await asyncio.sleep(random.uniform(10, 18))
 
-        except errors.FloodWaitError as e:
-            await asyncio.sleep(e.seconds + 5)
-            CHANNELS_QUEUE.insert(0, channel_id) 
-            continue
-        except Exception:
+        except Exception as e:
             status_tracker["skipped"] += 1
             status_tracker["completed"] += 1
             continue
 
-    if not CHANNELS_QUEUE:
-        save_queue_state([]) 
-
     CROSS_LOOP_RUNNING = False
-    status_tracker["current_channel"] = "None"
-
-    summary_text = (
-        f"✅ **Silent Automation Loop Completed!**\n\n"
-        f"📊 **Final Summary:**\n"
-        f"• Total Channels in Folder: {status_tracker['total']}\n"
-        f"• Successfully Processed: {status_tracker['completed'] - status_tracker['skipped']}\n"
-        f"• Skipped / Third-Party IDs: {status_tracker['skipped']}"
-    )
-    await client.send_message('me', summary_text)
-
-@app.before_serving
-async def startup():
-    await client.start()
+    status_tracker["current_channel"] = "Completed"
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
