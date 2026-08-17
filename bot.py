@@ -228,8 +228,9 @@ async def get_folder_channels_safely(target_name, event):
                                 channel_ids.append(raw_id)
     except Exception:
         pass
-    # Yaha par 20 limit set kar di gayi hai (Aapki requirement)
-    return list(set(channel_ids))[:20]
+    
+    # Yaha par limit hata di gayi hai! Ab folder ke saare channels par kaam hoga.
+    return list(set(channel_ids))
 
 # ========================================================
 # BOT COMMANDS HANDLER
@@ -312,8 +313,9 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
-        hot_display = "\n".join(hot_list[:10]) or "No Hot Channels Yet."
-        cold_display = "\n".join(cold_list[:10]) or "No Cold Channels Yet."
+        # Yaha par Status me dikhane ke liye 20-20 ki limit set kardi hai
+        hot_display = "\n".join(hot_list[:20]) or "No Hot Channels Yet."
+        cold_display = "\n".join(cold_list[:20]) or "No Cold Channels Yet."
 
         status_text = (
             f"📊 **DEVIL LIVE TRACKER STATUS (Account 2)**\n\n"
@@ -322,8 +324,8 @@ async def controller(event):
             f"• Skipped: {status_tracker['skipped']}\n"
             f"• Remaining: {status_tracker['remaining']}\n"
             f"• Current Focus: **{status_tracker['current_channel']}**\n\n"
-            f"🔥 **HOT ZONE (Top 10 Gainers)**\n{hot_display}\n\n"
-            f"❄️ **COLD ZONE (Bottom 10 Channels)**\n{cold_display}"
+            f"🔥 **HOT ZONE (Top 20 Gainers)**\n{hot_display}\n\n"
+            f"❄️ **COLD ZONE (Bottom 20 Channels)**\n{cold_display}"
         )
         await event.reply(status_text)
 
