@@ -151,13 +151,11 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     candidate_links = []
 
     for msg in messages_list:
-        # Extract from hidden markdown links
         if msg.entities:
             for entity in msg.entities:
                 if isinstance(entity, MessageEntityTextUrl) and entity.url:
                     candidate_links.append(entity.url)
 
-        # Extract from Inline Buttons
         if hasattr(msg, 'reply_markup') and msg.reply_markup:
             try:
                 if hasattr(msg.reply_markup, 'rows'):
@@ -168,7 +166,6 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
             except Exception:
                 pass
                 
-        # Extract plain text links
         if msg.message:
             post_text = msg.message
             tg_pattern = r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)'
@@ -251,11 +248,15 @@ async def get_folder_channels_safely(target_name, event):
     return list(set(channel_ids))
 
 # ========================================================
-# BOT COMMANDS HANDLER
+# BOT COMMANDS HANDLER (Fixed for everywhere including Saved Messages)
 # ========================================================
-@client.on(events.NewMessage(chats='me'))
+@client.on(events.NewMessage(outgoing=True))
 async def controller(event):
     global CROSS_LOOP_RUNNING, CHANNELS_QUEUE
+    
+    if not event.raw_text:
+        return
+        
     text = event.raw_text.strip().lower()
 
     if text == "/cross start":
@@ -378,7 +379,6 @@ async def run_cross_loop(source_msgs, event):
 
             messages_to_scan = []
             try:
-                # Scan last 6 messages + pinned messages to find "no link" / hidden links
                 async for last_msg in client.iter_messages(real_entity, limit=6):
                     messages_to_scan.append(last_msg)
                 pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=2)
@@ -480,7 +480,6 @@ async def run_cross_loop(source_msgs, event):
 
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
-            # Ek token extract karte hain duplicate check ke liye
             link_token = None
             if target_link:
                 token_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', target_link)
@@ -493,7 +492,6 @@ async def run_cross_loop(source_msgs, event):
             while (asyncio.get_event_loop().time() - start_monitor_time) < total_wait_duration and CROSS_LOOP_RUNNING:
                 await asyncio.sleep(random.uniform(10, 15))
 
-                # Check agar cross channel se post remove ho gayi
                 try:
                     chk_msg = await client.get_messages(real_entity, ids=first_fwd_id)
                     if not chk_msg or getattr(chk_msg, 'empty', False):
@@ -501,20 +499,16 @@ async def run_cross_loop(source_msgs, event):
                 except Exception:
                     break
 
-                # Smart Checker: Check if target admin manually posted their link in main channel
                 if link_token:
                     try:
                         recent_main = await client.get_messages(TARGET_MAIN_CHANNEL, limit=5)
                         for rm in recent_main:
                             if rm.id not in target_drop_ids:
                                 if check_duplicate_link_in_msg(rm, link_token):
-                                    # Agar admin ne manually post kar diya toh bot apna pehla post delete karega
                                     if bot_drop_id and bot_drop_id in target_drop_ids:
                                         await client.delete_messages(TARGET_MAIN_CHANNEL, bot_drop_id)
                                         target_drop_ids.remove(bot_drop_id)
                                         bot_drop_id = None
-                                    
-                                    # Is naye post ko list mein daal do taaki cross khatam hone par ye bhi delete ho jaye
                                     target_drop_ids.append(rm.id)
                     except Exception:
                         pass
@@ -530,7 +524,6 @@ async def run_cross_loop(source_msgs, event):
             joins_gained = max(0, after_joins - before_joins)
             update_joins_score(channel_id, ch_title, joins_gained)
 
-            # End mein saare tracked drop links (bot wale aur admin wale) ko delete kar do
             for t_id in target_drop_ids:
                 try:
                     await client.delete_messages(TARGET_MAIN_CHANNEL, t_id)
@@ -552,7 +545,7 @@ async def run_cross_loop(source_msgs, event):
             await asyncio.sleep(5)
 
 # ========================================================
-# 🚀 QUART LIFECYCLE STARTUP HOOK (FOR UVICORN / RENDER)
+# 🚀 QUART LIFECYCLE STARTUP HOOK
 # ========================================================
 @app.before_serving
 async def startup():
