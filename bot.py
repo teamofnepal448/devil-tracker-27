@@ -113,14 +113,36 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# UPGRADED 5-STAGE LINK DETECTOR ENGINE
+# ADVANCED LINK DETECTOR ENGINE
 # ========================================================
+def check_duplicate_link_in_msg(msg, target_token):
+    if not target_token:
+        return False
+    target_token = target_token.lower()
+    
+    if msg.raw_text and target_token in msg.raw_text.lower():
+        return True
+        
+    if msg.entities:
+        for entity in msg.entities:
+            if isinstance(entity, MessageEntityTextUrl) and entity.url:
+                if target_token in entity.url.lower():
+                    return True
+                    
+    if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
+        for row in msg.reply_markup.rows:
+            for button in row.buttons:
+                if hasattr(button, 'url') and button.url:
+                    if target_token in button.url.lower():
+                        return True
+    return False
+
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     current_channel_id = current_channel_entity.id
     current_username = getattr(current_channel_entity, 'username', '')
     current_username_lower = current_username.lower().strip() if current_username else "___none___"
 
-    blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo"]
+    blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo", "link not allowed"]
 
     for msg in messages_list:
         if msg.message and any(word in msg.message.lower() for word in blacklist_words):
@@ -129,35 +151,32 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     candidate_links = []
 
     for msg in messages_list:
+        # Extract from hidden markdown links
         if msg.entities:
             for entity in msg.entities:
                 if isinstance(entity, MessageEntityTextUrl) and entity.url:
                     candidate_links.append(entity.url)
 
-    if not candidate_links:
-        for msg in messages_list:
-            if hasattr(msg, 'reply_markup') and msg.reply_markup:
-                try:
-                    if hasattr(msg.reply_markup, 'rows'):
-                        for row in msg.reply_markup.rows:
-                            for button in row.buttons:
-                                if hasattr(button, 'url') and button.url:
-                                    candidate_links.append(button.url)
-                except Exception:
-                    pass
-
-    if not candidate_links:
-        post_text = " "
-        for msg in messages_list:
-            if msg.message:
-                post_text += msg.message + " "
-
-        tg_pattern = r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)'
-        raw_tg_links = re.findall(tg_pattern, post_text)
-        raw_mentions = re.findall(r'@([\w\-]+)', post_text)
-        
-        for token in list(set(raw_tg_links + raw_mentions)):
-            candidate_links.append(f"https://t.me/{token}")
+        # Extract from Inline Buttons
+        if hasattr(msg, 'reply_markup') and msg.reply_markup:
+            try:
+                if hasattr(msg.reply_markup, 'rows'):
+                    for row in msg.reply_markup.rows:
+                        for button in row.buttons:
+                            if hasattr(button, 'url') and button.url:
+                                candidate_links.append(button.url)
+            except Exception:
+                pass
+                
+        # Extract plain text links
+        if msg.message:
+            post_text = msg.message
+            tg_pattern = r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)'
+            raw_tg_links = re.findall(tg_pattern, post_text)
+            raw_mentions = re.findall(r'@([\w\-]+)', post_text)
+            
+            for token in list(set(raw_tg_links + raw_mentions)):
+                candidate_links.append(f"https://t.me/{token}")
 
     valid_extracted_link = None
     for raw_link in candidate_links:
@@ -229,7 +248,6 @@ async def get_folder_channels_safely(target_name, event):
     except Exception:
         pass
     
-    # Yaha par limit hata di gayi hai! Ab folder ke saare channels par kaam hoga.
     return list(set(channel_ids))
 
 # ========================================================
@@ -313,7 +331,6 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
-        # Yaha par Status me dikhane ke liye 20-20 ki limit set kardi hai
         hot_display = "\n".join(hot_list[:20]) or "No Hot Channels Yet."
         cold_display = "\n".join(cold_list[:20]) or "No Cold Channels Yet."
 
@@ -361,11 +378,12 @@ async def run_cross_loop(source_msgs, event):
 
             messages_to_scan = []
             try:
-                async for last_msg in client.iter_messages(real_entity, limit=3):
+                # Scan last 6 messages + pinned messages to find "no link" / hidden links
+                async for last_msg in client.iter_messages(real_entity, limit=6):
                     messages_to_scan.append(last_msg)
-                pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=1)
-                if pinned_msgs:
-                    messages_to_scan.append(pinned_msgs[0])
+                pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=2)
+                for pm in pinned_msgs:
+                    messages_to_scan.append(pm)
             except Exception:
                 pass
 
@@ -409,21 +427,23 @@ async def run_cross_loop(source_msgs, event):
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             await asyncio.sleep(random.uniform(1.5, 3.8))
 
-            drop = None
+            target_drop_ids = []
+            bot_drop_id = None
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
+                if drop:
+                    bot_drop_id = drop.id
+                    target_drop_ids.append(drop.id)
 
             stop_secondary_flag = asyncio.Event()
 
             async def send_secondary_posts_task():
                 if len(source_msgs) <= 1:
                     return
-
                 for msg in source_msgs[1:]:
                     post_delay = random.randint(60, 180)
                     elapsed = 0
-                    
                     while elapsed < post_delay:
                         if stop_secondary_flag.is_set() or not CROSS_LOOP_RUNNING:
                             return
@@ -460,18 +480,44 @@ async def run_cross_loop(source_msgs, event):
 
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
+            # Ek token extract karte hain duplicate check ke liye
+            link_token = None
+            if target_link:
+                token_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', target_link)
+                if token_match:
+                    link_token = token_match.group(1)
+
             start_monitor_time = asyncio.get_event_loop().time()
             total_wait_duration = 300
 
             while (asyncio.get_event_loop().time() - start_monitor_time) < total_wait_duration and CROSS_LOOP_RUNNING:
-                await asyncio.sleep(random.uniform(10, 18))
+                await asyncio.sleep(random.uniform(10, 15))
 
+                # Check agar cross channel se post remove ho gayi
                 try:
                     chk_msg = await client.get_messages(real_entity, ids=first_fwd_id)
                     if not chk_msg or getattr(chk_msg, 'empty', False):
                         break
                 except Exception:
                     break
+
+                # Smart Checker: Check if target admin manually posted their link in main channel
+                if link_token:
+                    try:
+                        recent_main = await client.get_messages(TARGET_MAIN_CHANNEL, limit=5)
+                        for rm in recent_main:
+                            if rm.id not in target_drop_ids:
+                                if check_duplicate_link_in_msg(rm, link_token):
+                                    # Agar admin ne manually post kar diya toh bot apna pehla post delete karega
+                                    if bot_drop_id and bot_drop_id in target_drop_ids:
+                                        await client.delete_messages(TARGET_MAIN_CHANNEL, bot_drop_id)
+                                        target_drop_ids.remove(bot_drop_id)
+                                        bot_drop_id = None
+                                    
+                                    # Is naye post ko list mein daal do taaki cross khatam hone par ye bhi delete ho jaye
+                                    target_drop_ids.append(rm.id)
+                    except Exception:
+                        pass
 
             stop_secondary_flag.set()
             sec_task.cancel()
@@ -484,9 +530,10 @@ async def run_cross_loop(source_msgs, event):
             joins_gained = max(0, after_joins - before_joins)
             update_joins_score(channel_id, ch_title, joins_gained)
 
-            if drop:
+            # End mein saare tracked drop links (bot wale aur admin wale) ko delete kar do
+            for t_id in target_drop_ids:
                 try:
-                    await client.delete_messages(TARGET_MAIN_CHANNEL, drop.id)
+                    await client.delete_messages(TARGET_MAIN_CHANNEL, t_id)
                 except Exception:
                     pass
 
