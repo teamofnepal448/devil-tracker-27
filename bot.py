@@ -9,23 +9,19 @@ import re
 import random
 import json
 from datetime import datetime
-from quart import Quart
+from quart import Quart, jsonify, request
 
 app = Quart(__name__)
 
-@app.route('/')
-async def home():
-    return "Official IPL Titan Live Join-Tracker V4.9 (Account 2): Async Dynamic Sync Engine Active!"
-
 # ========================================================
-# CONFIGURATION (NEW API CREDENTIALS)
+# CONFIGURATION & ENV VARIABLES
 # ========================================================
-api_id = 36094172
-api_hash = "ff6eee1bcccf82daea88c63c45b6b546"
-
+API_ID = int(os.environ.get("API_ID", 36094172))
+API_HASH = os.environ.get("API_HASH", "ff6eee1bcccf82daea88c63c45b6b546")
 SESSION_STRING = os.environ.get("SESSION_STRING", None)
-TARGET_MAIN_CHANNEL = -1002413253133 
-FOLDER_TARGET_NAME = "RAN X CROXX"
+
+TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", -1002413253133))
+FOLDER_TARGET_NAME = os.environ.get("FOLDER_TARGET_NAME", "RAN X CROXX")
 
 # Multi-account isolation: DB path & session name
 DB_FILE_NAME = os.environ.get("DB_FILE_NAME", "devil_analytics_acc2.json")
@@ -36,13 +32,14 @@ else:
     DB_FILE = DB_FILE_NAME
 
 if SESSION_STRING:
-    client = TelegramClient(StringSession(SESSION_STRING.strip()), api_id, api_hash)
+    client = TelegramClient(StringSession(SESSION_STRING.strip()), API_ID, API_HASH)
 else:
-    client = TelegramClient("devil_main_session_acc2", api_id, api_hash)
+    client = TelegramClient("devil_main_session_acc2", API_ID, API_HASH)
 
 CROSS_LOOP_RUNNING = False
 MEMORY_CACHE = {}
 CHANNELS_QUEUE = [] 
+CURRENT_SOURCE_MSGS = []
 
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
@@ -113,14 +110,14 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# UPGRADED DEEP LINK DETECTOR ENGINE (BUTTONS + TEXT + HYPERLINKS)
+# UPGRADED HIGH-PRECISION LINK DETECTOR ENGINE
 # ========================================================
 def get_all_links_from_msg(msg):
     links = []
     if not msg:
         return links
         
-    # 1. Inline Keyboard Buttons Scanning (Deep Inline Link Detection)
+    # 1. Inline Keyboard Buttons Scanning
     if hasattr(msg, 'reply_markup') and msg.reply_markup:
         try:
             if hasattr(msg.reply_markup, 'rows'):
@@ -131,21 +128,30 @@ def get_all_links_from_msg(msg):
         except Exception:
             pass
 
-    # 2. Text Hyperlinks & Embedded URLs (TextUrl & Url Entities)
+    # 2. Text Hyperlinks & Embedded Entities
     if hasattr(msg, 'entities') and msg.entities:
         for entity in msg.entities:
             if isinstance(entity, MessageEntityTextUrl) and getattr(entity, 'url', None):
                 links.append(entity.url.strip())
 
-    # 3. Raw Text Regex Scanning (t.me, telegram.me, @usernames, joinchat, addlist, +)
+    # 3. Optimized Precision Regex for Raw Text
     raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
     if raw_text:
-        tg_pattern = r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)'
-        raw_tg_links = re.findall(tg_pattern, raw_text.lower())
-        raw_mentions = re.findall(r'@([\w\-]+)', raw_text.lower())
+        # Regex covering: t.me/channel, t.me/+hash, t.me/joinchat/hash, telegram.me/+hash, t.me/addlist/hash
+        tg_pattern = r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[\w\-]+|joinchat/[\w\-]+|addlist/[\w\-]+|[\w\-]+)'
+        raw_matches = re.findall(tg_pattern, raw_text, re.IGNORECASE)
         
-        for token in list(set(raw_tg_links + raw_mentions)):
-            links.append(f"https://t.me/{token}")
+        # Username Mentions (@channelname)
+        mentions = re.findall(r'(?<!\w)@([\w\-]+)', raw_text)
+
+        for match in raw_matches:
+            clean_link = match if match.lower().startswith('http') else f"https://{match}"
+            # Normalize telegram.me -> t.me for consistency
+            clean_link = re.sub(r'https?://(?:www\.)?telegram\.me/', 'https://t.me/', clean_link, flags=re.IGNORECASE)
+            links.append(clean_link)
+
+        for mention in mentions:
+            links.append(f"https://t.me/{mention}")
 
     return list(set(links))
 
@@ -167,13 +173,11 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
 
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo", "link not allowed"]
 
-    # Blacklist check
     for msg in messages_list:
         raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
         if raw_text and any(word in raw_text.lower() for word in blacklist_words):
             return False, None
 
-    # Extract all candidate links from the scanned posts
     candidate_links = []
     for msg in messages_list:
         candidate_links.extend(get_all_links_from_msg(msg))
@@ -182,25 +186,19 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     for raw_link in list(set(candidate_links)):
         link_lower = raw_link.lower().strip()
 
-        # Ignore internal bot/titan/devil/self links
         if any(b in link_lower for b in ["devil", "titan", "bot"]) or current_username_lower in link_lower:
             continue
 
-        token_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', raw_link)
-        if not token_match:
-            continue
-        token = token_match.group(1)
-
         try:
-            resolved_entity = await client.get_entity(token)
+            # Resolve Telegram entity via exact URL structure or username/invite
+            resolved_entity = await client.get_entity(raw_link)
             if isinstance(resolved_entity, User):
                 continue
 
-            # If link belongs to current channel, record it
             if resolved_entity.id == current_channel_id:
-                valid_extracted_link = f"https://t.me/{token}" if raw_link.startswith("http") else raw_link
+                valid_extracted_link = raw_link
             else:
-                # 🚨 Found another channel's promotion link in buttons/text -> SKIP CHANNEL IMMEDIATELY
+                # Other channel promo found -> Skip channel
                 return False, None
         except Exception:
             continue
@@ -210,12 +208,12 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
 
     # Fallback to Bio checks
     if bio_text:
-        bio_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', bio_text)
-        for token in bio_tg_links:
+        bio_links = get_all_links_from_msg(type('DummyMsg', (), {'raw_text': bio_text, 'reply_markup': None, 'entities': None})())
+        for link in bio_links:
             try:
-                resolved_entity = await client.get_entity(token)
+                resolved_entity = await client.get_entity(link)
                 if resolved_entity.id == current_channel_id:
-                    return True, f"https://t.me/{token}"
+                    return True, link
             except Exception:
                 continue
 
@@ -230,7 +228,7 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
 # ========================================================
 # FOLDER CHANNELS SYSTEM
 # ========================================================
-async def get_folder_channels_safely(target_name, event):
+async def get_folder_channels_safely(target_name):
     channel_ids = []
     try:
         result = await client(GetDialogFiltersRequest())
@@ -254,11 +252,88 @@ async def get_folder_channels_safely(target_name, event):
     return list(set(channel_ids))
 
 # ========================================================
-# BOT COMMANDS HANDLER
+# WEB REST API ENDPOINTS (FOR WEB ADMIN PANEL INTEGRATION)
+# ========================================================
+@app.route('/')
+async def home():
+    return jsonify({
+        "status": "online",
+        "engine": "Official Cross-Promotion Automation Engine V5.1",
+        "is_running": CROSS_LOOP_RUNNING
+    })
+
+@app.route('/api/status', methods=['GET'])
+async def api_status():
+    db = load_analytics()
+    sorted_channels = [item for item in db.items() if item[0] != "saved_queue_state"]
+    sorted_channels = sorted(sorted_channels, key=lambda x: x[1].get("total_joins", 0), reverse=True)
+
+    analytics_data = []
+    for k, v in sorted_channels:
+        analytics_data.append({
+            "channel_id": k,
+            "title": v.get("title", "Unknown"),
+            "total_joins": v.get("total_joins", 0),
+            "runs": v.get("runs", 0),
+            "history": v.get("time_history", [])
+        })
+
+    return jsonify({
+        "running": CROSS_LOOP_RUNNING,
+        "tracker": status_tracker,
+        "queue_length": len(CHANNELS_QUEUE),
+        "analytics": analytics_data
+    })
+
+@app.route('/api/start', methods=['POST'])
+async def api_start():
+    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, CURRENT_SOURCE_MSGS
+    if CROSS_LOOP_RUNNING:
+        return jsonify({"status": "error", "message": "Engine is already running!"}), 400
+
+    CROSS_LOOP_RUNNING = True
+    saved_q = get_saved_queue_state()
+
+    if saved_q:
+        CHANNELS_QUEUE = saved_q
+    else:
+        channels = await get_folder_channels_safely(FOLDER_TARGET_NAME)
+        if not channels:
+            CROSS_LOOP_RUNNING = False
+            return jsonify({"status": "error", "message": f"Folder '{FOLDER_TARGET_NAME}' is empty or not found!"}), 400
+        
+        random.shuffle(channels)
+        db = load_analytics()
+        channels.sort(key=lambda c: db.get(str(c), {}).get("total_joins", 0), reverse=True)
+        CHANNELS_QUEUE = list(channels)
+
+    status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
+    
+    asyncio.get_event_loop().create_task(run_cross_loop(CURRENT_SOURCE_MSGS))
+    return jsonify({"status": "success", "message": "Cross loop started successfully!", "queue_count": len(CHANNELS_QUEUE)})
+
+@app.route('/api/stop', methods=['POST'])
+async def api_stop():
+    global CROSS_LOOP_RUNNING
+    CROSS_LOOP_RUNNING = False
+    save_queue_state(CHANNELS_QUEUE)
+    return jsonify({"status": "success", "message": "Loop stopped. Current progress saved."})
+
+@app.route('/api/reset', methods=['POST'])
+async def api_reset():
+    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE
+    CROSS_LOOP_RUNNING = False
+    save_queue_state([])
+    CHANNELS_QUEUE = []
+    status_tracker.update({"total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"})
+    return jsonify({"status": "success", "message": "Queue reset completed."})
+
+# ========================================================
+# BOT TELEGRAM COMMANDS HANDLER
 # ========================================================
 @client.on(events.NewMessage(outgoing=True))
 async def controller(event):
-    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE
+    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, CURRENT_SOURCE_MSGS
     
     if not event.raw_text:
         return
@@ -267,10 +342,10 @@ async def controller(event):
 
     if text == "/cross start":
         if not event.is_reply:
-            await event.reply("⚠️ Post par reply karke command do bhai!")
+            await event.reply("⚠️ Reply to a post to set promo messages!")
             return
         if CROSS_LOOP_RUNNING:
-            await event.reply("⚠️ Loop pehle se chal raha hai!")
+            await event.reply("⚠️ Loop is already running!")
             return
 
         reply_msg = await event.get_reply_message()
@@ -286,14 +361,16 @@ async def controller(event):
         except Exception:
             pass
 
+        CURRENT_SOURCE_MSGS = source_msgs
+
         saved_q = get_saved_queue_state()
         if saved_q:
             CHANNELS_QUEUE = saved_q
-            await event.reply(f"🔄 **Purana state mila!** Wahi se continue kar raha hu. Remaining: {len(CHANNELS_QUEUE)} channels.")
+            await event.reply(f"🔄 **Resuming saved state!** Remaining: {len(CHANNELS_QUEUE)} channels.")
         else:
-            channels = await get_folder_channels_safely(FOLDER_TARGET_NAME, event)
+            channels = await get_folder_channels_safely(FOLDER_TARGET_NAME)
             if not channels:
-                await event.reply(f"❌ Folder '{FOLDER_TARGET_NAME}' khali mila!")
+                await event.reply(f"❌ Folder '{FOLDER_TARGET_NAME}' is empty!")
                 CROSS_LOOP_RUNNING = False
                 return
             random.shuffle(channels)
@@ -302,14 +379,14 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Multi-Stage Engine V4.9 (Acc 2).** (Captured {len(source_msgs)} posts). Processing {len(CHANNELS_QUEUE)} channels...")
+            await event.reply(f"🚀 **Multi-Stage Engine V5.1.** Processing {len(CHANNELS_QUEUE)} channels...")
 
-        asyncio.get_event_loop().create_task(run_cross_loop(source_msgs, event))
+        asyncio.get_event_loop().create_task(run_cross_loop(source_msgs))
 
     elif text == "/cross stop":
         CROSS_LOOP_RUNNING = False
         save_queue_state(CHANNELS_QUEUE)
-        await event.reply("🛑 Loop rok diya gaya hai. Current progress save kar li gayi hai.")
+        await event.reply("🛑 Loop stopped & queue saved.")
 
     elif text == "/cross reset":
         save_queue_state([])
@@ -338,25 +415,25 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
-        hot_display = "\n".join(hot_list[:20]) or "No Hot Channels Yet."
-        cold_display = "\n".join(cold_list[:20]) or "No Cold Channels Yet."
+        hot_display = "\n".join(hot_list[:15]) or "No Hot Channels Yet."
+        cold_display = "\n".join(cold_list[:15]) or "No Cold Channels Yet."
 
         status_text = (
-            f"📊 **DEVIL LIVE TRACKER STATUS (Account 2)**\n\n"
+            f"📊 **DEVIL LIVE TRACKER STATUS**\n\n"
             f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
             f"• Processed: {status_tracker['completed']} / {status_tracker['total']}\n"
             f"• Skipped: {status_tracker['skipped']}\n"
             f"• Remaining: {status_tracker['remaining']}\n"
             f"• Current Focus: **{status_tracker['current_channel']}**\n\n"
-            f"🔥 **HOT ZONE (Top 20 Gainers)**\n{hot_display}\n\n"
-            f"❄️ **COLD ZONE (Bottom 20 Channels)**\n{cold_display}"
+            f"🔥 **HOT ZONE**\n{hot_display}\n\n"
+            f"❄️ **COLD ZONE**\n{cold_display}"
         )
         await event.reply(status_text)
 
 # ========================================================
 # CORE AUTOMATION ENGINE
 # ========================================================
-async def run_cross_loop(source_msgs, event):
+async def run_cross_loop(source_msgs):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE
 
     status_tracker.update({"total": len(CHANNELS_QUEUE) + status_tracker['completed'], "remaining": len(CHANNELS_QUEUE)})
@@ -385,7 +462,6 @@ async def run_cross_loop(source_msgs, event):
 
             messages_to_scan = []
             try:
-                # 🎯 STRICT 4 POST SCAN (Full Scanner)
                 async for last_msg in client.iter_messages(real_entity, limit=4):
                     messages_to_scan.append(last_msg)
                     
@@ -488,11 +564,7 @@ async def run_cross_loop(source_msgs, event):
 
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
-            link_token = None
-            if target_link:
-                token_match = re.search(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', target_link)
-                if token_match:
-                    link_token = token_match.group(1)
+            link_token = target_link
 
             start_monitor_time = asyncio.get_event_loop().time()
             total_wait_duration = 300
@@ -553,11 +625,11 @@ async def run_cross_loop(source_msgs, event):
             await asyncio.sleep(5)
 
 # ========================================================
-# 🚀 QUART LIFECYCLE STARTUP HOOK
+# STARTUP HOOK & LIFECYCLE
 # ========================================================
 @app.before_serving
 async def startup():
-    print("🚀 Starting Telegram Client (Acc 2) via Quart Lifecycle...")
+    print("🚀 Starting Telegram Client via Quart Lifecycle...")
     await client.start()
     print("✅ Telegram Client Connected Successfully!")
 
