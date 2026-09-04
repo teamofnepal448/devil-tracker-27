@@ -1,8 +1,11 @@
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetDialogFiltersRequest
+from telethon.tl.functions.messages import GetDialogFiltersRequest, CheckChatInviteRequest
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned, User, MessageEntityTextUrl, MessageEntityUrl
+from telethon.tl.types import (
+    DialogFilter, PeerChannel, InputMessagesFilterPinned, User, 
+    MessageEntityTextUrl, MessageEntityUrl, ChatInvite, ChatInviteAlready
+)
 import asyncio
 import os
 import re
@@ -23,7 +26,6 @@ SESSION_STRING = os.environ.get("SESSION_STRING", None)
 TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", -1002413253133))
 FOLDER_TARGET_NAME = os.environ.get("FOLDER_TARGET_NAME", "RAN X CROXX")
 
-# Multi-account isolation: DB path & session name
 DB_FILE_NAME = os.environ.get("DB_FILE_NAME", "devil_analytics_acc2.json")
 
 if os.path.exists("/data"):
@@ -110,14 +112,20 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# UPGRADED HIGH-PRECISION LINK DETECTOR ENGINE
+# ADVANCED SAFE LINK RESOLVER & DETECTOR ENGINE
 # ========================================================
+def extract_link_token(link):
+    """Extracts unique token from public or private links for duplicate checking."""
+    if not link:
+        return ""
+    match = re.search(r'(?:t\.me|telegram\.me)/(?:\+|joinchat/|addlist/)?([\w\-]+)', link, re.IGNORECASE)
+    return match.group(1).lower() if match else ""
+
 def get_all_links_from_msg(msg):
     links = []
     if not msg:
         return links
         
-    # 1. Inline Keyboard Buttons Scanning
     if hasattr(msg, 'reply_markup') and msg.reply_markup:
         try:
             if hasattr(msg.reply_markup, 'rows'):
@@ -128,25 +136,19 @@ def get_all_links_from_msg(msg):
         except Exception:
             pass
 
-    # 2. Text Hyperlinks & Embedded Entities
     if hasattr(msg, 'entities') and msg.entities:
         for entity in msg.entities:
             if isinstance(entity, MessageEntityTextUrl) and getattr(entity, 'url', None):
                 links.append(entity.url.strip())
 
-    # 3. Optimized Precision Regex for Raw Text
     raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
     if raw_text:
-        # Regex covering: t.me/channel, t.me/+hash, t.me/joinchat/hash, telegram.me/+hash, t.me/addlist/hash
         tg_pattern = r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[\w\-]+|joinchat/[\w\-]+|addlist/[\w\-]+|[\w\-]+)'
         raw_matches = re.findall(tg_pattern, raw_text, re.IGNORECASE)
-        
-        # Username Mentions (@channelname)
         mentions = re.findall(r'(?<!\w)@([\w\-]+)', raw_text)
 
         for match in raw_matches:
             clean_link = match if match.lower().startswith('http') else f"https://{match}"
-            # Normalize telegram.me -> t.me for consistency
             clean_link = re.sub(r'https?://(?:www\.)?telegram\.me/', 'https://t.me/', clean_link, flags=re.IGNORECASE)
             links.append(clean_link)
 
@@ -155,16 +157,37 @@ def get_all_links_from_msg(msg):
 
     return list(set(links))
 
-def check_duplicate_link_in_msg(msg, target_token):
+def check_duplicate_link_in_msg(msg, target_link):
+    target_token = extract_link_token(target_link)
     if not target_token:
         return False
-    target_token = target_token.lower()
     
     extracted_links = get_all_links_from_msg(msg)
     for link in extracted_links:
-        if target_token in link.lower():
+        if target_token in extract_link_token(link):
             return True
     return False
+
+async def safe_resolve_entity_id(link):
+    """Safely resolves channel ID without crashing on private invite links (+ or joinchat)."""
+    try:
+        invite_match = re.search(r'(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w\-]+)', link, re.IGNORECASE)
+        if invite_match:
+            invite_hash = invite_match.group(1)
+            res = await client(CheckChatInviteRequest(invite_hash))
+            if isinstance(res, (ChatInviteAlready, ChatInvite)):
+                return getattr(res.chat, 'id', None)
+            return None
+
+        if 'addlist/' in link.lower():
+            return None
+
+        resolved = await client.get_entity(link)
+        if isinstance(resolved, User):
+            return None
+        return getattr(resolved, 'id', None)
+    except Exception:
+        return None
 
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     current_channel_id = current_channel_entity.id
@@ -189,33 +212,22 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
         if any(b in link_lower for b in ["devil", "titan", "bot"]) or current_username_lower in link_lower:
             continue
 
-        try:
-            # Resolve Telegram entity via exact URL structure or username/invite
-            resolved_entity = await client.get_entity(raw_link)
-            if isinstance(resolved_entity, User):
-                continue
-
-            if resolved_entity.id == current_channel_id:
+        resolved_id = await safe_resolve_entity_id(raw_link)
+        if resolved_id:
+            if resolved_id == current_channel_id:
                 valid_extracted_link = raw_link
             else:
-                # Other channel promo found -> Skip channel
                 return False, None
-        except Exception:
-            continue
 
     if valid_extracted_link:
         return True, valid_extracted_link
 
-    # Fallback to Bio checks
     if bio_text:
         bio_links = get_all_links_from_msg(type('DummyMsg', (), {'raw_text': bio_text, 'reply_markup': None, 'entities': None})())
         for link in bio_links:
-            try:
-                resolved_entity = await client.get_entity(link)
-                if resolved_entity.id == current_channel_id:
-                    return True, link
-            except Exception:
-                continue
+            resolved_id = await safe_resolve_entity_id(link)
+            if resolved_id == current_channel_id:
+                return True, link
 
     if current_username:
         return True, f"https://t.me/{current_username}"
@@ -252,13 +264,13 @@ async def get_folder_channels_safely(target_name):
     return list(set(channel_ids))
 
 # ========================================================
-# WEB REST API ENDPOINTS (FOR WEB ADMIN PANEL INTEGRATION)
+# WEB REST API ENDPOINTS
 # ========================================================
 @app.route('/')
 async def home():
     return jsonify({
         "status": "online",
-        "engine": "Official Cross-Promotion Automation Engine V5.1",
+        "engine": "Official Cross-Promotion Automation Engine V5.2",
         "is_running": CROSS_LOOP_RUNNING
     })
 
@@ -329,18 +341,23 @@ async def api_reset():
     return jsonify({"status": "success", "message": "Queue reset completed."})
 
 # ========================================================
-# BOT TELEGRAM COMMANDS HANDLER
+# BOT TELEGRAM COMMANDS HANDLER (FIXED CONTROLLER)
 # ========================================================
-@client.on(events.NewMessage(outgoing=True))
+@client.on(events.NewMessage())
 async def controller(event):
     global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, CURRENT_SOURCE_MSGS
     
+    # Restrict commands to account owner/self
+    me = await client.get_me()
+    if event.sender_id != me.id and not event.out:
+        return
+
     if not event.raw_text:
         return
         
     text = event.raw_text.strip().lower()
 
-    if text == "/cross start":
+    if text.startswith("/cross start"):
         if not event.is_reply:
             await event.reply("⚠️ Reply to a post to set promo messages!")
             return
@@ -379,23 +396,23 @@ async def controller(event):
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Multi-Stage Engine V5.1.** Processing {len(CHANNELS_QUEUE)} channels...")
+            await event.reply(f"🚀 **Multi-Stage Engine V5.2.** Processing {len(CHANNELS_QUEUE)} channels...")
 
         asyncio.get_event_loop().create_task(run_cross_loop(source_msgs))
 
-    elif text == "/cross stop":
+    elif text.startswith("/cross stop"):
         CROSS_LOOP_RUNNING = False
         save_queue_state(CHANNELS_QUEUE)
         await event.reply("🛑 Loop stopped & queue saved.")
 
-    elif text == "/cross reset":
+    elif text.startswith("/cross reset"):
         save_queue_state([])
         CHANNELS_QUEUE = []
         CROSS_LOOP_RUNNING = False
         status_tracker.update({"total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"})
         await event.reply("🔄 Queue Reset completed!")
 
-    elif text == "/status":
+    elif text.startswith("/status"):
         db = load_analytics()
         sorted_channels = [item for item in db.items() if item[0] != "saved_queue_state"]
         sorted_channels = sorted(sorted_channels, key=lambda x: x[1].get("total_joins", 0), reverse=True)
@@ -564,8 +581,6 @@ async def run_cross_loop(source_msgs):
 
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
-            link_token = target_link
-
             start_monitor_time = asyncio.get_event_loop().time()
             total_wait_duration = 300
 
@@ -579,12 +594,12 @@ async def run_cross_loop(source_msgs):
                 except Exception:
                     break
 
-                if link_token:
+                if target_link:
                     try:
                         recent_main = await client.get_messages(TARGET_MAIN_CHANNEL, limit=5)
                         for rm in recent_main:
                             if rm.id not in target_drop_ids:
-                                if check_duplicate_link_in_msg(rm, link_token):
+                                if check_duplicate_link_in_msg(rm, target_link):
                                     if bot_drop_id and bot_drop_id in target_drop_ids:
                                         await client.delete_messages(TARGET_MAIN_CHANNEL, bot_drop_id)
                                         target_drop_ids.remove(bot_drop_id)
