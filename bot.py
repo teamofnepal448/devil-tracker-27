@@ -2,7 +2,7 @@ from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned, User, MessageEntityTextUrl
+from telethon.tl.types import DialogFilter, PeerChannel, InputMessagesFilterPinned, User, MessageEntityTextUrl, MessageEntityUrl
 import asyncio
 import os
 import re
@@ -113,28 +113,51 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# ADVANCED LINK DETECTOR ENGINE
+# UPGRADED DEEP LINK DETECTOR ENGINE (BUTTONS + TEXT + HYPERLINKS)
 # ========================================================
+def get_all_links_from_msg(msg):
+    links = []
+    if not msg:
+        return links
+        
+    # 1. Inline Keyboard Buttons Scanning (Deep Inline Link Detection)
+    if hasattr(msg, 'reply_markup') and msg.reply_markup:
+        try:
+            if hasattr(msg.reply_markup, 'rows'):
+                for row in msg.reply_markup.rows:
+                    for button in row.buttons:
+                        if hasattr(button, 'url') and button.url:
+                            links.append(button.url.strip())
+        except Exception:
+            pass
+
+    # 2. Text Hyperlinks & Embedded URLs (TextUrl & Url Entities)
+    if hasattr(msg, 'entities') and msg.entities:
+        for entity in msg.entities:
+            if isinstance(entity, MessageEntityTextUrl) and getattr(entity, 'url', None):
+                links.append(entity.url.strip())
+
+    # 3. Raw Text Regex Scanning (t.me, telegram.me, @usernames, joinchat, addlist, +)
+    raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
+    if raw_text:
+        tg_pattern = r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)'
+        raw_tg_links = re.findall(tg_pattern, raw_text.lower())
+        raw_mentions = re.findall(r'@([\w\-]+)', raw_text.lower())
+        
+        for token in list(set(raw_tg_links + raw_mentions)):
+            links.append(f"https://t.me/{token}")
+
+    return list(set(links))
+
 def check_duplicate_link_in_msg(msg, target_token):
     if not target_token:
         return False
     target_token = target_token.lower()
     
-    if msg.raw_text and target_token in msg.raw_text.lower():
-        return True
-        
-    if msg.entities:
-        for entity in msg.entities:
-            if isinstance(entity, MessageEntityTextUrl) and entity.url:
-                if target_token in entity.url.lower():
-                    return True
-                    
-    if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
-        for row in msg.reply_markup.rows:
-            for button in row.buttons:
-                if hasattr(button, 'url') and button.url:
-                    if target_token in button.url.lower():
-                        return True
+    extracted_links = get_all_links_from_msg(msg)
+    for link in extracted_links:
+        if target_token in link.lower():
+            return True
     return False
 
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
@@ -144,41 +167,22 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
 
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo", "link not allowed"]
 
+    # Blacklist check
     for msg in messages_list:
-        if msg.message and any(word in msg.message.lower() for word in blacklist_words):
+        raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
+        if raw_text and any(word in raw_text.lower() for word in blacklist_words):
             return False, None
 
+    # Extract all candidate links from the scanned posts
     candidate_links = []
-
     for msg in messages_list:
-        if msg.entities:
-            for entity in msg.entities:
-                if isinstance(entity, MessageEntityTextUrl) and entity.url:
-                    candidate_links.append(entity.url)
-
-        if hasattr(msg, 'reply_markup') and msg.reply_markup:
-            try:
-                if hasattr(msg.reply_markup, 'rows'):
-                    for row in msg.reply_markup.rows:
-                        for button in row.buttons:
-                            if hasattr(button, 'url') and button.url:
-                                candidate_links.append(button.url)
-            except Exception:
-                pass
-                
-        if msg.message:
-            post_text = msg.message
-            tg_pattern = r'(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)'
-            raw_tg_links = re.findall(tg_pattern, post_text)
-            raw_mentions = re.findall(r'@([\w\-]+)', post_text)
-            
-            for token in list(set(raw_tg_links + raw_mentions)):
-                candidate_links.append(f"https://t.me/{token}")
+        candidate_links.extend(get_all_links_from_msg(msg))
 
     valid_extracted_link = None
-    for raw_link in candidate_links:
+    for raw_link in list(set(candidate_links)):
         link_lower = raw_link.lower().strip()
 
+        # Ignore internal bot/titan/devil/self links
         if any(b in link_lower for b in ["devil", "titan", "bot"]) or current_username_lower in link_lower:
             continue
 
@@ -192,10 +196,11 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
             if isinstance(resolved_entity, User):
                 continue
 
+            # If link belongs to current channel, record it
             if resolved_entity.id == current_channel_id:
                 valid_extracted_link = f"https://t.me/{token}" if raw_link.startswith("http") else raw_link
-                break
             else:
+                # 🚨 Found another channel's promotion link in buttons/text -> SKIP CHANNEL IMMEDIATELY
                 return False, None
         except Exception:
             continue
@@ -203,6 +208,7 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     if valid_extracted_link:
         return True, valid_extracted_link
 
+    # Fallback to Bio checks
     if bio_text:
         bio_tg_links = re.findall(r'(?:t\.me|telegram\.me)/(?:joinchat/|addlist/|\+)?([\w\-]+)', bio_text)
         for token in bio_tg_links:
@@ -248,7 +254,7 @@ async def get_folder_channels_safely(target_name, event):
     return list(set(channel_ids))
 
 # ========================================================
-# BOT COMMANDS HANDLER (Fixed for everywhere including Saved Messages)
+# BOT COMMANDS HANDLER
 # ========================================================
 @client.on(events.NewMessage(outgoing=True))
 async def controller(event):
@@ -379,9 +385,11 @@ async def run_cross_loop(source_msgs, event):
 
             messages_to_scan = []
             try:
-                async for last_msg in client.iter_messages(real_entity, limit=6):
+                # 🎯 STRICT 4 POST SCAN (Full Scanner)
+                async for last_msg in client.iter_messages(real_entity, limit=4):
                     messages_to_scan.append(last_msg)
-                pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=2)
+                    
+                pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=1)
                 for pm in pinned_msgs:
                     messages_to_scan.append(pm)
             except Exception:
