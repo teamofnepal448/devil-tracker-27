@@ -47,6 +47,9 @@ status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None"
 }
 
+# Global cache for resolving links to minimize redundant API calls
+LINK_RESOLVE_CACHE = {}
+
 # ========================================================
 # STORAGE SYSTEM WITH QUEUE PERSISTENCE
 # ========================================================
@@ -112,36 +115,63 @@ async def get_current_join_requests(target_channel):
     return 0
 
 # ========================================================
-# ADVANCED SAFE LINK RESOLVER & DETECTOR ENGINE
+# ADVANCED UPGRADED LINK DETECTOR & RESOLVER ENGINE
 # ========================================================
 def extract_link_token(link):
     """Extracts unique token from public or private links for duplicate checking."""
     if not link:
         return ""
-    match = re.search(r'(?:t\.me|telegram\.me)/(?:\+|joinchat/|addlist/)?([\w\-]+)', link, re.IGNORECASE)
-    return match.group(1).lower() if match else ""
+    clean_link = link.strip().rstrip('/')
+    match = re.search(r'(?:t\.me|telegram\.me)/(?:\+|joinchat/|addlist/)?([\w\-]+)', clean_link, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    if clean_link.startswith('@'):
+        return clean_link[1:].lower()
+    return clean_link.lower()
 
 def get_all_links_from_msg(msg):
+    """
+    Detects Telegram links from:
+    1. Inline Buttons
+    2. Text & Media Captions (Photo/Video/Doc)
+    3. Hidden Links (MessageEntityTextUrl & MessageEntityUrl)
+    4. @username mentions
+    5. Private Invite links (+ / joinchat / addlist)
+    """
     links = []
     if not msg:
         return links
-        
+
+    # 1. Inline Buttons
     if hasattr(msg, 'reply_markup') and msg.reply_markup:
         try:
             if hasattr(msg.reply_markup, 'rows'):
                 for row in msg.reply_markup.rows:
-                    for button in row.buttons:
+                    for button in getattr(row, 'buttons', []):
                         if hasattr(button, 'url') and button.url:
                             links.append(button.url.strip())
         except Exception:
             pass
 
+    # 2. Extract Text / Media Caption
+    raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
+
+    # 3. Text Entities (Hidden links & Text URLs)
     if hasattr(msg, 'entities') and msg.entities:
         for entity in msg.entities:
             if isinstance(entity, MessageEntityTextUrl) and getattr(entity, 'url', None):
                 links.append(entity.url.strip())
+            elif isinstance(entity, MessageEntityUrl) and raw_text:
+                try:
+                    offset = entity.offset
+                    length = entity.length
+                    extracted_url = raw_text[offset:offset+length]
+                    if extracted_url:
+                        links.append(extracted_url.strip())
+                except Exception:
+                    pass
 
-    raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
+    # 4. Regex Pattern Matching in Text & Captions
     if raw_text:
         tg_pattern = r'(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[\w\-]+|joinchat/[\w\-]+|addlist/[\w\-]+|[\w\-]+)'
         raw_matches = re.findall(tg_pattern, raw_text, re.IGNORECASE)
@@ -155,44 +185,88 @@ def get_all_links_from_msg(msg):
         for mention in mentions:
             links.append(f"https://t.me/{mention}")
 
-    return list(set(links))
+    # Deduplicate extracted links preserving order
+    seen_tokens = set()
+    unique_links = []
+    for l in links:
+        l_lower = l.lower()
+        if 't.me/' in l_lower or 'telegram.me/' in l_lower or l_lower.startswith('@'):
+            token = extract_link_token(l)
+            if token and token not in seen_tokens:
+                seen_tokens.add(token)
+                unique_links.append(l)
+
+    return unique_links
 
 def check_duplicate_link_in_msg(msg, target_link):
     target_token = extract_link_token(target_link)
     if not target_token:
         return False
-    
+
     extracted_links = get_all_links_from_msg(msg)
     for link in extracted_links:
-        if target_token in extract_link_token(link):
+        if target_token == extract_link_token(link):
             return True
     return False
 
 async def safe_resolve_entity_id(link):
-    """Safely resolves channel ID without crashing on private invite links (+ or joinchat)."""
+    """
+    Safely resolves channel ID without joining channels or crashing on invite links.
+    Returns:
+        int: Normalized positive channel ID
+        'UNKNOWN': If link cannot be resolved (to ensure foreign drops are not missed)
+    """
+    token = extract_link_token(link)
+    if not token:
+        return 'UNKNOWN'
+
+    if token in LINK_RESOLVE_CACHE:
+        return LINK_RESOLVE_CACHE[token]
+
+    resolved_id = 'UNKNOWN'
+
     try:
+        # Private invite links (+HASH or joinchat/HASH)
         invite_match = re.search(r'(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w\-]+)', link, re.IGNORECASE)
         if invite_match:
             invite_hash = invite_match.group(1)
-            res = await client(CheckChatInviteRequest(invite_hash))
-            if isinstance(res, (ChatInviteAlready, ChatInvite)):
-                return getattr(res.chat, 'id', None)
-            return None
+            try:
+                res = await client(CheckChatInviteRequest(invite_hash))
+                if isinstance(res, (ChatInviteAlready, ChatInvite)):
+                    if hasattr(res, 'chat') and res.chat:
+                        resolved_id = getattr(res.chat, 'id', 'UNKNOWN')
+            except errors.UserAlreadyParticipantError:
+                pass
+            except Exception:
+                resolved_id = 'UNKNOWN'
 
-        if 'addlist/' in link.lower():
-            return None
+        # Folder / Addlist links (addlist/HASH)
+        elif 'addlist/' in link.lower():
+            resolved_id = 'UNKNOWN'
 
-        resolved = await client.get_entity(link)
-        if isinstance(resolved, User):
-            return None
-        return getattr(resolved, 'id', None)
+        # Standard public links or @username
+        else:
+            try:
+                clean_target = link if not link.startswith('@') else link
+                resolved = await client.get_entity(clean_target)
+                if isinstance(resolved, User):
+                    resolved_id = getattr(resolved, 'id', 'UNKNOWN')
+                else:
+                    resolved_id = getattr(resolved, 'id', 'UNKNOWN')
+            except Exception:
+                resolved_id = 'UNKNOWN'
+
     except Exception:
-        return None
+        resolved_id = 'UNKNOWN'
+
+    if isinstance(resolved_id, int):
+        resolved_id = abs(resolved_id)
+
+    LINK_RESOLVE_CACHE[token] = resolved_id
+    return resolved_id
 
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
-    current_channel_id = current_channel_entity.id
-    current_username = getattr(current_channel_entity, 'username', '')
-    current_username_lower = current_username.lower().strip() if current_username else "___none___"
+    current_channel_id = abs(current_channel_entity.id)
 
     blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo", "link not allowed"]
 
@@ -205,30 +279,44 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     for msg in messages_list:
         candidate_links.extend(get_all_links_from_msg(msg))
 
-    valid_extracted_link = None
-    for raw_link in list(set(candidate_links)):
-        link_lower = raw_link.lower().strip()
+    seen_tokens = set()
+    unique_candidate_links = []
+    for l in candidate_links:
+        tok = extract_link_token(l)
+        if tok and tok not in seen_tokens:
+            seen_tokens.add(tok)
+            unique_candidate_links.append(l)
 
-        if any(b in link_lower for b in ["devil", "titan", "bot"]) or current_username_lower in link_lower:
-            continue
+    own_extracted_links = []
 
+    for raw_link in unique_candidate_links:
         resolved_id = await safe_resolve_entity_id(raw_link)
-        if resolved_id:
-            if resolved_id == current_channel_id:
-                valid_extracted_link = raw_link
-            else:
-                return False, None
 
-    if valid_extracted_link:
-        return True, valid_extracted_link
+        # Rule 17: If link is UNKNOWN (unresolvable), treat as unsafe foreign drop
+        if resolved_id == 'UNKNOWN':
+            return False, None
+
+        # Rule 10: Current channel link = OWN
+        if resolved_id == current_channel_id:
+            own_extracted_links.append(raw_link)
+        # Rule 11 & 12: Foreign channel link = FOREIGN DROP -> Trigger SKIP logic
+        else:
+            return False, None
+
+    if own_extracted_links:
+        return True, own_extracted_links[0]
 
     if bio_text:
-        bio_links = get_all_links_from_msg(type('DummyMsg', (), {'raw_text': bio_text, 'reply_markup': None, 'entities': None})())
+        dummy_msg = type('DummyMsg', (), {'raw_text': bio_text, 'message': bio_text, 'reply_markup': None, 'entities': None})()
+        bio_links = get_all_links_from_msg(dummy_msg)
         for link in bio_links:
             resolved_id = await safe_resolve_entity_id(link)
             if resolved_id == current_channel_id:
                 return True, link
+            elif resolved_id != 'UNKNOWN':
+                return False, None
 
+    current_username = getattr(current_channel_entity, 'username', '')
     if current_username:
         return True, f"https://t.me/{current_username}"
 
@@ -341,13 +429,12 @@ async def api_reset():
     return jsonify({"status": "success", "message": "Queue reset completed."})
 
 # ========================================================
-# BOT TELEGRAM COMMANDS HANDLER (FIXED CONTROLLER)
+# BOT TELEGRAM COMMANDS HANDLER
 # ========================================================
 @client.on(events.NewMessage())
 async def controller(event):
     global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, CURRENT_SOURCE_MSGS
     
-    # Restrict commands to account owner/self
     me = await client.get_me()
     if event.sender_id != me.id and not event.out:
         return
