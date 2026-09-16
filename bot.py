@@ -11,8 +11,17 @@ import os
 import re
 import random
 import json
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from quart import Quart, jsonify, request
+
+# ========================================================
+# 🚀 TIMEZONE CONFIGURATION (IST / NPT FIX)
+# ========================================================
+LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
+
+def get_local_now():
+    return datetime.now(LOCAL_TZ)
 
 # ========================================================
 # 🚀 QUART WEB APP INITIALIZATION (FOR HOSTING/RENDER)
@@ -26,8 +35,7 @@ API_ID = int(os.environ.get("API_ID", 36094172))
 API_HASH = os.environ.get("API_HASH", "ff6eee1bcccf82daea88c63c45b6b546")
 SESSION_STRING = os.environ.get("SESSION_STRING", None)
 
-# UPDATED MAIN CHANNEL ID: 2413253133 (-1002413253133)
-TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", -1002413253133))
+TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", -1001716302260))
 FOLDER_TARGET_NAME = os.environ.get("FOLDER_TARGET_NAME", "RAN X CROXX")
 DB_FILE_NAME = os.environ.get("DB_FILE_NAME", "devil_analytics_acc2.json")
 
@@ -40,17 +48,42 @@ if 'client' not in globals() or client is None:
         client = TelegramClient("devil_main_session_acc2", API_ID, API_HASH)
 
 CROSS_LOOP_RUNNING = False
-LOOP_END_TIME = None  # Timer Tracker
+LOOP_END_TIME = None  
 MEMORY_CACHE = {}
 CHANNELS_QUEUE = [] 
-SKIPPED_QUEUE = []    # Dedicated Queue for Skipped Channels to Re-Check
+PERMANENT_BAD_CHANNELS = set()
 CURRENT_SOURCE_MSGS = []
+ME_ID = None  # Global User ID cache for fast command response
 
 status_tracker = {
     "total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None", "timer_end": "None"
 }
 
 LINK_RESOLVE_CACHE = {}
+
+# ========================================================
+# 🛡️ AUTOMATION SAFE API WRAPPER (UPGRADED FLOODWAIT)
+# ========================================================
+async def safe_api_call(coro_func, *args, retries=3, **kwargs):
+    """Executes API calls safely with limited FloodWait retries & permission handling."""
+    attempt = 0
+    while attempt < retries:
+        try:
+            return await coro_func(*args, **kwargs)
+        except errors.FloodWaitError as e:
+            attempt += 1
+            wait_time = e.seconds + 3
+            print(f"⚠️ FloodWait Detected (Attempt {attempt}/{retries}): Sleeping for {wait_time}s...")
+            if attempt >= retries:
+                print("❌ Max FloodWait retries exceeded. Request safely aborted.")
+                return None
+            await asyncio.sleep(wait_time)
+        except (errors.ChatAdminRequiredError, errors.ChannelPrivateError, errors.ChatWriteForbiddenError, errors.UserBannedInChannelError):
+            return "PERMISSION_ERROR"
+        except Exception as e:
+            print(f"⚠️ API Exception Handled: {e}")
+            return None
+    return None
 
 # ========================================================
 # 💾 STORAGE & ANALYTICS PERSISTENCE ENGINE
@@ -91,8 +124,9 @@ def get_saved_queue_state():
 def update_joins_score(channel_id, channel_title, joins_gained):
     db = load_analytics()
     ch_key = str(channel_id)
-    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    current_hour = datetime.now().strftime("%I:%M %p")
+    now = get_local_now()
+    current_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    current_hour = now.strftime("%I:%M %p")
 
     if ch_key not in db:
         db[ch_key] = {"title": channel_title, "total_joins": 0, "runs": 0, "time_history": []}
@@ -107,14 +141,18 @@ def update_joins_score(channel_id, channel_title, joins_gained):
     })
     save_analytics(db)
 
+# ========================================================
+# 📊 ANALYTICS IMPROVEMENT (SAFE JOIN REQUEST DETECTOR)
+# ========================================================
 async def get_current_join_requests(target_channel):
     try:
-        full_channel = await client(GetFullChannelRequest(target_channel))
-        if hasattr(full_channel.full_chat, 'requests_pending'):
-            return full_channel.full_chat.requests_pending or 0
-    except Exception:
-        pass
-    return 0
+        full_channel = await safe_api_call(client, GetFullChannelRequest(target_channel))
+        if full_channel and full_channel != "PERMISSION_ERROR":
+            if hasattr(full_channel.full_chat, 'requests_pending'):
+                return full_channel.full_chat.requests_pending if full_channel.full_chat.requests_pending is not None else 0
+    except Exception as e:
+        print(f"⚠️ Join request API check failed gracefully: {e}")
+    return None
 
 # ========================================================
 # 🔗 LINK DETECTOR & SAFE RESOLVER ENGINE
@@ -123,14 +161,11 @@ def clean_and_repair_url(url):
     if not url:
         return ""
     url = url.strip()
-    
     match = re.search(r'(?:t\.me|telegram\.me)/(.*)', url, re.IGNORECASE)
     if match:
         return f"https://t.me/{match.group(1)}"
-        
     if url.startswith('@'):
         return f"https://t.me/{url[1:]}"
-        
     return url
 
 def extract_link_token(link):
@@ -173,7 +208,6 @@ def get_all_links_from_msg(msg):
 
         for match in raw_matches:
             links.append(clean_and_repair_url(match))
-
         for mention in mentions:
             links.append(f"https://t.me/{mention}")
 
@@ -215,22 +249,21 @@ async def safe_resolve_entity_id(link):
         if invite_match:
             invite_hash = invite_match.group(1)
             try:
-                res = await client(CheckChatInviteRequest(invite_hash))
+                res = await safe_api_call(client, CheckChatInviteRequest(invite_hash))
                 if isinstance(res, (ChatInviteAlready, ChatInvite)) and hasattr(res, 'chat') and res.chat:
                     resolved_id = getattr(res.chat, 'id', 'UNKNOWN')
-            except (errors.UserAlreadyParticipantError, Exception):
+            except Exception:
                 resolved_id = 'UNKNOWN'
         elif 'addlist/' in link.lower():
             resolved_id = 'UNKNOWN'
         else:
             try:
-                resolved = await client.get_entity(link)
-                resolved_id = getattr(resolved, 'id', 'UNKNOWN')
+                resolved = await safe_api_call(client.get_entity, link)
+                if resolved and resolved != "PERMISSION_ERROR":
+                    resolved_id = getattr(resolved, 'id', 'UNKNOWN')
             except Exception:
                 resolved_id = 'UNKNOWN'
 
-    except errors.FloodWaitError as e:
-        await asyncio.sleep(e.seconds)
     except Exception:
         resolved_id = 'UNKNOWN'
 
@@ -294,12 +327,15 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
     return True, "SKIP_DROP"
 
 # ========================================================
-# 📁 FOLDER CHANNELS SCANNER
+# 📁 FOLDER CHANNELS SCANNER (ROBUST FULL EXTRACTOR)
 # ========================================================
 async def get_folder_channels_safely(target_name):
     channel_ids = []
     try:
-        result = await client(GetDialogFiltersRequest())
+        result = await safe_api_call(client, GetDialogFiltersRequest())
+        if not result or result == "PERMISSION_ERROR":
+            return []
+        
         target_clean = str(target_name).strip().lower()
         filters_list = result.filters if hasattr(result, 'filters') else result
 
@@ -309,9 +345,7 @@ async def get_folder_channels_safely(target_name):
                 if folder_title.lower() == target_clean:
                     if hasattr(dialog_filter, 'include_peers'):
                         for peer in dialog_filter.include_peers:
-                            raw_id = None
-                            if hasattr(peer, 'channel_id'): raw_id = peer.channel_id
-                            elif isinstance(peer, PeerChannel): raw_id = peer.channel_id
+                            raw_id = getattr(peer, 'channel_id', None) or getattr(peer, 'chat_id', None)
                             if raw_id:
                                 channel_ids.append(raw_id)
     except Exception:
@@ -323,7 +357,6 @@ async def get_folder_channels_safely(target_name):
 # ⏱️ TIME DURATION PARSER
 # ========================================================
 def parse_duration(text_args):
-    """Parses text like '10 hour', '5h', '30 min', '1 day' into seconds"""
     if not text_args:
         return None
     match = re.search(r'(\d+)\s*(hour|hr|h|min|m|day|d)?', text_args, re.IGNORECASE)
@@ -341,13 +374,27 @@ def parse_duration(text_args):
     return val * 3600
 
 # ========================================================
-# 🌐 WEB REST API ENDPOINTS
+# 🌐 WEB REST API ENDPOINTS & LIFECYCLE HOOKS
 # ========================================================
+@app.before_serving
+async def startup_client():
+    """Ensure Telethon client starts automatically when hosted via ASGI/Quart."""
+    global ME_ID
+    if not client.is_connected():
+        await client.start()
+    try:
+        me = await client.get_me()
+        if me:
+            ME_ID = me.id
+    except Exception as e:
+        print(f"⚠️ Warning getting me entity: {e}")
+    print("✅ Devil Engine V6.0 SafeGuard connected & ready for commands.")
+
 @app.route('/')
 async def home():
     return jsonify({
         "status": "online",
-        "engine": "Devil Cross-Promotion Engine V5.5",
+        "engine": "Devil Cross-Promotion Engine V6.0 SafeGuard",
         "is_running": CROSS_LOOP_RUNNING
     })
 
@@ -371,7 +418,6 @@ async def api_status():
         "running": CROSS_LOOP_RUNNING,
         "tracker": status_tracker,
         "queue_length": len(CHANNELS_QUEUE),
-        "skipped_queue_length": len(SKIPPED_QUEUE),
         "analytics": analytics_data
     })
 
@@ -386,11 +432,11 @@ async def api_start():
     seconds = parse_duration(duration_str)
     
     if seconds:
-        LOOP_END_TIME = datetime.now().timestamp() + seconds
-        status_tracker["timer_end"] = datetime.fromtimestamp(LOOP_END_TIME).strftime("%Y-%m-%d %I:%M %p")
+        LOOP_END_TIME = get_local_now() + timedelta(seconds=seconds)
+        status_tracker["timer_end"] = LOOP_END_TIME.strftime("%I:%M %p (%d-%b)")
     else:
         LOOP_END_TIME = None
-        status_tracker["timer_end"] = "Unlimited"
+        status_tracker["timer_end"] = "24/7 Unlimited Mode"
 
     CROSS_LOOP_RUNNING = True
     saved_q = get_saved_queue_state()
@@ -403,9 +449,6 @@ async def api_start():
             CROSS_LOOP_RUNNING = False
             return jsonify({"status": "error", "message": f"Folder '{FOLDER_TARGET_NAME}' is empty or not found!"}), 400
         
-        random.shuffle(channels)
-        db = load_analytics()
-        channels.sort(key=lambda c: db.get(str(c), {}).get("total_joins", 0), reverse=True)
         CHANNELS_QUEUE = list(channels)
 
     status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
@@ -418,29 +461,38 @@ async def api_stop():
     global CROSS_LOOP_RUNNING, LOOP_END_TIME
     CROSS_LOOP_RUNNING = False
     LOOP_END_TIME = None
-    save_queue_state(CHANNELS_QUEUE + SKIPPED_QUEUE)
+    save_queue_state(CHANNELS_QUEUE)
     return jsonify({"status": "success", "message": "Loop stopped. Current progress saved."})
 
 @app.route('/api/reset', methods=['POST'])
 async def api_reset():
-    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, SKIPPED_QUEUE, LOOP_END_TIME
+    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, LOOP_END_TIME, PERMANENT_BAD_CHANNELS
     CROSS_LOOP_RUNNING = False
     LOOP_END_TIME = None
+    PERMANENT_BAD_CHANNELS.clear()
     save_queue_state([])
     CHANNELS_QUEUE = []
-    SKIPPED_QUEUE = []
     status_tracker.update({"total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None", "timer_end": "None"})
     return jsonify({"status": "success", "message": "Queue reset completed."})
 
 # ========================================================
-# 🤖 BOT COMMAND CONTROLLER
+# 🤖 BOT COMMAND CONTROLLER (OPTIMIZED COMMAND HANDLER)
 # ========================================================
 @client.on(events.NewMessage())
 async def controller(event):
-    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, SKIPPED_QUEUE, CURRENT_SOURCE_MSGS, LOOP_END_TIME
+    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, CURRENT_SOURCE_MSGS, LOOP_END_TIME, PERMANENT_BAD_CHANNELS, ME_ID
     
-    me = await client.get_me()
-    if event.sender_id != me.id and not event.out:
+    # Ensure ME_ID is set without blocking calls
+    if ME_ID is None:
+        try:
+            me = await client.get_me()
+            if me:
+                ME_ID = me.id
+        except Exception:
+            pass
+
+    # Process command if it was sent by user or outgoing from this account
+    if ME_ID and event.sender_id != ME_ID and not event.out:
         return
 
     if not event.raw_text:
@@ -457,30 +509,30 @@ async def controller(event):
             await event.reply("⚠️ Loop is already running!")
             return
 
-        # Time Duration Parse (e.g. /cross start 10 hour)
         duration_args = text[12:].strip()
         duration_sec = parse_duration(duration_args)
 
         if duration_sec:
-            LOOP_END_TIME = datetime.now().timestamp() + duration_sec
-            end_dt = datetime.fromtimestamp(LOOP_END_TIME).strftime("%I:%M %p (%d-%b)")
+            LOOP_END_TIME = get_local_now() + timedelta(seconds=duration_sec)
+            end_dt = LOOP_END_TIME.strftime("%I:%M %p (%d-%b)")
             status_tracker["timer_end"] = end_dt
-            timer_msg = f"⏱️ **Timer Set:** Auto-stop at `{end_dt}`"
+            timer_msg = f"⏱️ **Timer Set:** Active for `{duration_args}` (Auto-Stop at {end_dt})"
         else:
             LOOP_END_TIME = None
-            status_tracker["timer_end"] = "Unlimited"
-            timer_msg = "♾️ **Timer:** Continuous mode (No Limit)"
+            status_tracker["timer_end"] = "24/7 Unlimited Mode"
+            timer_msg = "♾️ **Timer:** Continuous Round-Robin Mode"
 
         reply_msg = await event.get_reply_message()
         CROSS_LOOP_RUNNING = True
 
         source_msgs = [reply_msg]
         try:
-            next_msgs = await client.get_messages(event.chat_id, min_id=reply_msg.id, limit=2, reverse=True)
-            for m in next_msgs:
-                if m.raw_text and m.raw_text.strip().lower().startswith("/"):
-                    continue
-                source_msgs.append(m)
+            next_msgs = await safe_api_call(client.get_messages, event.chat_id, min_id=reply_msg.id, limit=2, reverse=True)
+            if next_msgs and isinstance(next_msgs, list):
+                for m in next_msgs:
+                    if m.raw_text and m.raw_text.strip().lower().startswith("/"):
+                        continue
+                    source_msgs.append(m)
         except Exception:
             pass
 
@@ -489,37 +541,34 @@ async def controller(event):
         saved_q = get_saved_queue_state()
         if saved_q:
             CHANNELS_QUEUE = saved_q
-            await event.reply(f"🔄 **Resuming saved state!** Remaining: {len(CHANNELS_QUEUE)} channels.\n{timer_msg}")
+            await event.reply(f"🔄 **Resuming saved queue!** Queue size: {len(CHANNELS_QUEUE)}\n{timer_msg}")
         else:
             channels = await get_folder_channels_safely(FOLDER_TARGET_NAME)
             if not channels:
                 await event.reply(f"❌ Folder '{FOLDER_TARGET_NAME}' is empty!")
                 CROSS_LOOP_RUNNING = False
                 return
-            random.shuffle(channels)
-            db = load_analytics()
-            channels.sort(key=lambda c: db.get(str(c), {}).get("total_joins", 0), reverse=True)
             CHANNELS_QUEUE = list(channels)
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
-            await event.reply(f"🚀 **Devil Cross Engine V5.5.** Processing {len(CHANNELS_QUEUE)} channels...\n{timer_msg}")
+            await event.reply(f"🚀 **Devil Cross Engine V6.0 Active.** Target channels: {len(CHANNELS_QUEUE)}\n{timer_msg}")
 
         asyncio.create_task(run_cross_loop(source_msgs))
 
     elif lower_text.startswith("/cross stop"):
         CROSS_LOOP_RUNNING = False
         LOOP_END_TIME = None
-        save_queue_state(CHANNELS_QUEUE + SKIPPED_QUEUE)
-        await event.reply("🛑 Loop stopped & queue saved.")
+        save_queue_state(CHANNELS_QUEUE)
+        await event.reply("🛑 Loop stopped & queue state saved.")
 
     elif lower_text.startswith("/cross reset"):
         save_queue_state([])
         CHANNELS_QUEUE = []
-        SKIPPED_QUEUE = []
+        PERMANENT_BAD_CHANNELS.clear()
         CROSS_LOOP_RUNNING = False
         LOOP_END_TIME = None
         status_tracker.update({"total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None", "timer_end": "None"})
-        await event.reply("🔄 Queue Reset completed!")
+        await event.reply("🔄 Queue & Bad channel list reset completed!")
 
     elif lower_text.startswith("/status"):
         db = load_analytics()
@@ -541,64 +590,83 @@ async def controller(event):
             else:
                 cold_list.append(f"• {v['title']} {v['total_joins']} join")
 
-        hot_display = "\n".join(hot_list[:15]) or "No Hot Channels Yet."
-        cold_display = "\n".join(cold_list[:15]) or "No Cold Channels Yet."
+        hot_display = "\n".join(hot_list) if hot_list else "No Hot Channels Yet."
+        cold_display = "\n".join(cold_list) if cold_list else "No Cold Channels Yet."
 
         status_text = (
-            f"📊 **DEVIL LIVE TRACKER STATUS V5.5**\n\n"
-            f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
-            f"• Timer Auto-Stop: **{status_tracker.get('timer_end', 'None')}**\n"
-            f"• Processed: {status_tracker['completed']} / {status_tracker['total']}\n"
-            f"• Pending Re-check Queue: {len(SKIPPED_QUEUE)}\n"
-            f"• Remaining: {status_tracker['remaining']}\n"
+            f"📊 **DEVIL ENGINE V6.0 STATUS**\n\n"
+            f"• Engine Status: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
+            f"• Mode: **{status_tracker.get('timer_end', 'None')}**\n"
+            f"• Total Processed: {status_tracker['completed']}\n"
+            f"• Permanently Skipped: {len(PERMANENT_BAD_CHANNELS)}\n"
+            f"• Active Queue Remaining: {status_tracker['remaining']}\n"
             f"• Current Focus: **{status_tracker['current_channel']}**\n\n"
-            f"🔥 **HOT ZONE**\n{hot_display}\n\n"
-            f"❄️ **COLD ZONE**\n{cold_display}"
+            f"🔥 **HOT ZONE ({len(hot_list)})**\n{hot_display}\n\n"
+            f"❄️ **COLD ZONE ({len(cold_list)})**\n{cold_display}"
         )
+        
+        if len(status_text) > 4000:
+            status_text = status_text[:3950] + "\n\n... (Truncated due to Telegram message length limit)"
+
         await event.reply(status_text)
 
 # ========================================================
-# ⚡ CORE AUTOMATION LOOP ENGINE (WITH RE-CHECK QUEUE & TIMER)
+# ⚡ CORE AUTOMATION LOOP ENGINE (UPGRADED QUEUE & SAFEGUARD)
 # ========================================================
 async def run_cross_loop(source_msgs):
-    global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE, SKIPPED_QUEUE, LOOP_END_TIME
+    global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE, LOOP_END_TIME, PERMANENT_BAD_CHANNELS
 
-    status_tracker.update({"total": len(CHANNELS_QUEUE) + len(SKIPPED_QUEUE) + status_tracker['completed'], "remaining": len(CHANNELS_QUEUE)})
+    status_tracker.update({"total": len(CHANNELS_QUEUE) + status_tracker['completed'], "remaining": len(CHANNELS_QUEUE)})
 
-    while (CHANNELS_QUEUE or SKIPPED_QUEUE) and CROSS_LOOP_RUNNING:
-        
-        # 1. Timer Check
-        if LOOP_END_TIME and datetime.now().timestamp() >= LOOP_END_TIME:
-            print("⏱️ Time limit reached! Automatically stopping cross engine.")
-            CROSS_LOOP_RUNNING = False
-            LOOP_END_TIME = None
-            save_queue_state(CHANNELS_QUEUE + SKIPPED_QUEUE)
-            break
-
-        # 2. Queue Refill Logic: Main Queue empty hone par Skipped Channels ko back to Queue lana
-        if not CHANNELS_QUEUE and SKIPPED_QUEUE:
-            print(f"🔄 Re-checking {len(SKIPPED_QUEUE)} skipped channels with existing links...")
-            CHANNELS_QUEUE = list(SKIPPED_QUEUE)
-            SKIPPED_QUEUE = []
-            await asyncio.sleep(60) # 1 Minute delay before restarting skipped sweep
-
-        save_queue_state(CHANNELS_QUEUE + SKIPPED_QUEUE) 
-
-        channel_id = CHANNELS_QUEUE.pop(0)
-        status_tracker["remaining"] = len(CHANNELS_QUEUE)
-
+    while CROSS_LOOP_RUNNING:
         try:
-            strict_id = int(f"-100{channel_id}" if not str(channel_id).startswith("-100") else channel_id)
-            if strict_id == int(TARGET_MAIN_CHANNEL):
+            if LOOP_END_TIME and get_local_now() >= LOOP_END_TIME:
+                print("⏱️ Set duration expired! Stopping cross engine cleanly.")
+                CROSS_LOOP_RUNNING = False
+                LOOP_END_TIME = None
+                save_queue_state(CHANNELS_QUEUE)
+                break
+
+            if not CHANNELS_QUEUE:
+                print(f"🔄 Queue completed! Reloading folder '{FOLDER_TARGET_NAME}' channels...")
+                channels = await get_folder_channels_safely(FOLDER_TARGET_NAME)
+                if channels:
+                    CHANNELS_QUEUE = [c for c in channels if c not in PERMANENT_BAD_CHANNELS]
+                    status_tracker["total"] += len(CHANNELS_QUEUE)
+                    save_queue_state(CHANNELS_QUEUE)
+                    await asyncio.sleep(15)
+                else:
+                    print("⚠️ Folder empty. Retrying scan in 30s...")
+                    await asyncio.sleep(30)
+                    continue
+
+            if not CHANNELS_QUEUE:
                 continue
 
-            try:
-                real_entity = await client.get_entity(strict_id)
-            except errors.FloodWaitError as e:
-                await asyncio.sleep(e.seconds)
-                real_entity = await client.get_entity(strict_id)
-            except ValueError:
+            channel_id = CHANNELS_QUEUE[0]
+            status_tracker["remaining"] = len(CHANNELS_QUEUE)
+
+            def finalize_current_channel():
+                global CHANNELS_QUEUE
+                if CHANNELS_QUEUE and CHANNELS_QUEUE[0] == channel_id:
+                    CHANNELS_QUEUE.pop(0)
+                    save_queue_state(CHANNELS_QUEUE)
+
+            if channel_id in PERMANENT_BAD_CHANNELS:
+                finalize_current_channel()
+                continue
+
+            strict_id = int(f"-100{channel_id}" if not str(channel_id).startswith("-100") else channel_id)
+            if strict_id == int(TARGET_MAIN_CHANNEL):
+                finalize_current_channel()
+                continue
+
+            real_entity = await safe_api_call(client.get_entity, strict_id)
+            if real_entity == "PERMISSION_ERROR" or not real_entity:
+                PERMANENT_BAD_CHANNELS.add(channel_id)
+                status_tracker["skipped"] += 1
                 status_tracker["completed"] += 1
+                finalize_current_channel()
                 continue
 
             ch_title = getattr(real_entity, 'title', 'Channel')
@@ -609,61 +677,60 @@ async def run_cross_loop(source_msgs):
                 async for last_msg in client.iter_messages(real_entity, limit=4):
                     messages_to_scan.append(last_msg)
                     
-                pinned_msgs = await client.get_messages(real_entity, filter=InputMessagesFilterPinned(), limit=1)
-                for pm in pinned_msgs:
-                    messages_to_scan.append(pm)
+                pinned_msgs = await safe_api_call(client.get_messages, real_entity, filter=InputMessagesFilterPinned(), limit=1)
+                if pinned_msgs and isinstance(pinned_msgs, list):
+                    for pm in pinned_msgs:
+                        messages_to_scan.append(pm)
             except Exception:
                 pass
 
             bio = ""
             try:
-                full_channel = await client(GetFullChannelRequest(real_entity))
-                bio = full_channel.full_chat.about or ""
+                full_channel = await safe_api_call(client, GetFullChannelRequest(real_entity))
+                if full_channel and full_channel != "PERMISSION_ERROR":
+                    bio = full_channel.full_chat.about or ""
             except Exception:
                 pass
 
             is_safe, target_link = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
 
-            # 3. Dynamic Retry Handling: Link present hai to Skip Queue me bhejo, direct drop nahi hoga!
             if not is_safe or not target_link or target_link == "SKIP_DROP":
-                SKIPPED_QUEUE.append(channel_id)
                 status_tracker["skipped"] += 1
+                finalize_current_channel()
                 continue
 
             fwd_ids = []
             first_fwd_id = None
 
             if source_msgs:
-                try:
-                    fwd_msgs = await client.forward_messages(real_entity, source_msgs[0])
+                fwd_msgs = await safe_api_call(client.forward_messages, real_entity, source_msgs[0], silent=False)
+                if fwd_msgs == "PERMISSION_ERROR":
+                    print(f"🚫 Permission error for {ch_title}. Permanently skipping channel.")
+                    PERMANENT_BAD_CHANNELS.add(channel_id)
+                    status_tracker["skipped"] += 1
+                    finalize_current_channel()
+                    continue
+                elif fwd_msgs:
                     fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
                     if hasattr(fwd, 'id') and fwd.id:
                         first_fwd_id = fwd.id
                         fwd_ids.append(first_fwd_id)
-                except errors.FloodWaitError as e:
-                    await asyncio.sleep(e.seconds)
-                except Exception:
-                    pass
 
             if not first_fwd_id:
-                SKIPPED_QUEUE.append(channel_id)
                 status_tracker["skipped"] += 1
+                finalize_current_channel()
                 continue
 
-            before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            await asyncio.sleep(random.uniform(1.5, 3.8))
+            main_channel_msg_ids = []
 
-            target_drop_ids = []
-            bot_drop_id = None
+            before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
+            await asyncio.sleep(random.uniform(1.5, 3.5))
+
             if target_link:
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
-                try:
-                    drop = await client.send_message(TARGET_MAIN_CHANNEL, drop_text)
-                    if drop:
-                        bot_drop_id = drop.id
-                        target_drop_ids.append(drop.id)
-                except Exception:
-                    pass
+                drop = await safe_api_call(client.send_message, TARGET_MAIN_CHANNEL, drop_text, silent=True)
+                if drop and hasattr(drop, 'id'):
+                    main_channel_msg_ids.append(drop.id)
 
             stop_secondary_flag = asyncio.Event()
 
@@ -671,7 +738,7 @@ async def run_cross_loop(source_msgs):
                 if len(source_msgs) <= 1:
                     return
                 for msg in source_msgs[1:]:
-                    post_delay = random.randint(60, 180)
+                    post_delay = random.randint(45, 120)
                     elapsed = 0
                     while elapsed < post_delay:
                         if stop_secondary_flag.is_set() or not CROSS_LOOP_RUNNING:
@@ -682,98 +749,75 @@ async def run_cross_loop(source_msgs):
                     if stop_secondary_flag.is_set() or not CROSS_LOOP_RUNNING:
                         return
 
-                    try:
-                        chk = await client.get_messages(real_entity, ids=first_fwd_id)
-                        if not chk or getattr(chk, 'empty', False):
-                            stop_secondary_flag.set()
-                            return
-                    except Exception:
+                    chk = await safe_api_call(client.get_messages, real_entity, ids=first_fwd_id)
+                    if not chk or getattr(chk, 'empty', False):
                         stop_secondary_flag.set()
                         return
 
-                    try:
-                        if msg.media:
-                            sec_fwd = await client.send_message(real_entity, msg.message or "", file=msg.media, reply_to=first_fwd_id)
-                        else:
-                            sec_fwd = await client.send_message(real_entity, msg.message or "", reply_to=first_fwd_id)
-                        if sec_fwd:
-                            fwd_ids.append(sec_fwd.id)
-                    except Exception:
-                        try:
-                            fwd_msgs = await client.forward_messages(real_entity, msg)
-                            sec_fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
-                            if sec_fwd:
-                                fwd_ids.append(sec_fwd.id)
-                        except Exception:
-                            pass
+                    if msg.media:
+                        sec_fwd = await safe_api_call(client.send_message, real_entity, msg.message or "", file=msg.media, reply_to=first_fwd_id, silent=False)
+                    else:
+                        sec_fwd = await safe_api_call(client.send_message, real_entity, msg.message or "", reply_to=first_fwd_id, silent=False)
+                    
+                    if sec_fwd and hasattr(sec_fwd, 'id'):
+                        fwd_ids.append(sec_fwd.id)
 
             sec_task = asyncio.create_task(send_secondary_posts_task())
 
             start_monitor_time = asyncio.get_event_loop().time()
-            total_wait_duration = 300
+            total_wait_duration = 300  # 5 minutes per channel
 
             while (asyncio.get_event_loop().time() - start_monitor_time) < total_wait_duration and CROSS_LOOP_RUNNING:
-                await asyncio.sleep(random.uniform(10, 15))
+                await asyncio.sleep(10)
 
-                try:
-                    chk_msg = await client.get_messages(real_entity, ids=first_fwd_id)
-                    if not chk_msg or getattr(chk_msg, 'empty', False):
-                        break
-                except Exception:
+                chk_msg = await safe_api_call(client.get_messages, real_entity, ids=first_fwd_id)
+                if not chk_msg or getattr(chk_msg, 'empty', False):
                     break
 
                 if target_link:
-                    try:
-                        recent_main = await client.get_messages(TARGET_MAIN_CHANNEL, limit=5)
+                    recent_main = await safe_api_call(client.get_messages, TARGET_MAIN_CHANNEL, limit=8)
+                    if recent_main and isinstance(recent_main, list):
                         for rm in recent_main:
-                            if rm.id not in target_drop_ids:
+                            if rm.id not in main_channel_msg_ids:
                                 if check_duplicate_link_in_msg(rm, target_link):
-                                    if bot_drop_id and bot_drop_id in target_drop_ids:
-                                        await client.delete_messages(TARGET_MAIN_CHANNEL, bot_drop_id)
-                                        target_drop_ids.remove(bot_drop_id)
-                                        bot_drop_id = None
-                                    target_drop_ids.append(rm.id)
-                    except Exception:
-                        pass
+                                    main_channel_msg_ids.append(rm.id)
 
             stop_secondary_flag.set()
             sec_task.cancel()
-            try:
-                await sec_task
-            except (asyncio.CancelledError, Exception):
-                pass
 
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            joins_gained = max(0, after_joins - before_joins)
-            update_joins_score(channel_id, ch_title, joins_gained)
+            if before_joins is not None and after_joins is not None:
+                joins_gained = max(0, after_joins - before_joins)
+                update_joins_score(channel_id, ch_title, joins_gained)
 
-            for t_id in target_drop_ids:
-                try:
-                    await client.delete_messages(TARGET_MAIN_CHANNEL, t_id)
-                except Exception:
-                    pass
+            if main_channel_msg_ids:
+                await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, main_channel_msg_ids)
+                main_channel_msg_ids.clear()
 
-            for f_id in fwd_ids:
-                try:
-                    await client.delete_messages(real_entity, f_id)
-                except Exception:
-                    pass
+            if fwd_ids:
+                await safe_api_call(client.delete_messages, real_entity, fwd_ids)
+                fwd_ids.clear()
 
             status_tracker["completed"] += 1
-            await asyncio.sleep(random.randint(10, 30))
+            finalize_current_channel()
+            await asyncio.sleep(random.randint(5, 10))
 
-        except Exception:
-            SKIPPED_QUEUE.append(channel_id)
-            status_tracker["skipped"] += 1
+        except Exception as global_err:
+            print(f"⚠️ Self-Healing Core: Recovered from exception -> {global_err}")
             await asyncio.sleep(5)
+            continue
 
 # ========================================================
 # 🚀 DEVIL ENGINE PANEL ENTRY POINT
 # ========================================================
 async def main():
+    global ME_ID
     if not client.is_connected():
         await client.start()
-    print("✅ Devil Cross Engine online & event handlers registered.")
+    me = await client.get_me()
+    if me:
+        ME_ID = me.id
+    print("✅ Devil Cross Engine V6.0 SafeGuard online & operational.")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
