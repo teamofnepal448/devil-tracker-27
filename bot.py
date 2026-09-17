@@ -87,7 +87,7 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "devil_main_session")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 TARGET_MAIN_CHANNEL = env_int("TARGET_MAIN_CHANNEL", 1716302260)
 FOLDER_TARGET_NAME = os.getenv("FOLDER_TARGET_NAME", "RAN X CROXX").strip()
