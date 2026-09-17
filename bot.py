@@ -46,7 +46,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
-TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", -1002413253133))
+TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", "-1001716302260"))
 FOLDER_TARGET_NAME = os.environ.get("FOLDER_TARGET_NAME", "RAN X CROXX")
 
 # Authorized users string (comma separated IDs)
