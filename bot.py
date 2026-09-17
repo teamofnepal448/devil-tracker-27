@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 import asyncio
 import json
 import logging
@@ -1892,7 +1891,7 @@ async def controller(event: Any) -> None:
 
 @app.before_serving
 async def startup() -> None:
-    global ME_ID, SCHEDULER_TASK
+    global ME_ID, SCHEDULER_TASK, CROSS_LOOP_RUNNING, RUN_TASK
 
     load_runtime_from_state()
 
@@ -1910,7 +1909,6 @@ async def startup() -> None:
 
     if CROSS_LOOP_RUNNING:
         if CURRENT_SOURCE_MSGS:
-            global RUN_TASK
             RUN_TASK = asyncio.create_task(run_cross_loop(), name="cross-engine")
             logger.info("[STARTUP] Resumed persisted engine state")
         else:
