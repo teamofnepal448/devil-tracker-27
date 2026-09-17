@@ -1,459 +1,1511 @@
-# ========================================================
-# IMPORTS
-# ========================================================
+From __future__ import annotations
+
 import asyncio
+import json
+import logging
 import os
 import re
-import random
-import json
+import threading
 import time
 import uuid
-import traceback
-from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Literal
 
-from telethon import TelegramClient, events, errors
-from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetDialogFiltersRequest, CheckChatInviteRequest
-from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import (
-    DialogFilter, InputMessagesFilterPinned,
-    MessageEntityTextUrl, MessageEntityUrl, ChatInvite, ChatInviteAlready
-)
 from quart import Quart, jsonify, request
+from telethon import TelegramClient, errors, events
+from telethon.sessions import StringSession
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, GetDialogFiltersRequest
+from telethon.tl.types import (
+    ChatInvite,
+    ChatInviteAlready,
+    DialogFilter,
+    InputMessagesFilterPinned,
+    MessageEntityTextUrl,
+    MessageEntityUrl,
+)
 
 try:
     from google import genai
-except ImportError:
+    from google.genai import types as genai_types
+except Exception:  # pragma: no cover - optional until dependency is installed
     genai = None
+    genai_types = None
+
+try:
+    from pydantic import BaseModel, Field
+except Exception:  # pragma: no cover
+    BaseModel = None  # type: ignore
+    Field = None  # type: ignore
 
 
-# ========================================================
-# CONFIGURATION & CONSTANTS
-# ========================================================
+# ============================================================
+# CONFIGURATION (HARDCODED DEFAULTS ATTACHED)
+# ============================================================
+
 LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
+APP_NAME = "Devil Cross-Promotion Engine + JARVIS V2"
+SCHEMA_VERSION = 2
 
-def get_local_now():
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+
+
+def parse_admin_ids(raw: str) -> set[int]:
+    result: set[int] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.add(int(part))
+        except ValueError:
+            raise RuntimeError(f"Invalid Telegram admin ID: {part!r}")
+    return result
+
+
+# Credentials and Configuration attached directly
+API_ID = env_int("API_ID", 36094172)
+API_HASH = os.getenv("API_HASH", "ff6eee1bcccf82daea88c63c45b6b546").strip()
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+SESSION_NAME = os.getenv("SESSION_NAME", "devil_main_session")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+
+TARGET_MAIN_CHANNEL = env_int("TARGET_MAIN_CHANNEL", 1716302260)
+FOLDER_TARGET_NAME = os.getenv("FOLDER_TARGET_NAME", "RAN X CROXX").strip()
+
+STATE_DIR = Path(os.getenv("STATE_DIR", "/data" if Path("/data").exists() else "."))
+STATE_FILE = Path(os.getenv("STATE_FILE", str(STATE_DIR / "jarvis_state.json")))
+
+JARVIS_WEB_TOKEN = os.getenv("JARVIS_WEB_TOKEN", "Jv9!kP7#xQ2@Lm8$Zr4").strip()
+AUTHORIZED_ADMINS = parse_admin_ids(os.getenv("AUTHORIZED_ADMINS", "8520210719"))
+
+ENGINE_ROUND_RELOAD_SECONDS = max(10, env_int("ENGINE_ROUND_RELOAD_SECONDS", 30))
+DEFERRED_RECHECK_SECONDS = max(10, env_int("DEFERRED_RECHECK_SECONDS", 60))
+MONITOR_SECONDS = max(30, env_int("MONITOR_SECONDS", 300))
+MONITOR_POLL_SECONDS = max(5, env_int("MONITOR_POLL_SECONDS", 10))
+SECONDARY_DELAY_MIN = max(0, env_int("SECONDARY_DELAY_MIN", 45))
+SECONDARY_DELAY_MAX = max(SECONDARY_DELAY_MIN, env_int("SECONDARY_DELAY_MAX", 120))
+POST_SETTLE_SECONDS = max(0, env_int("POST_SETTLE_SECONDS", 2))
+IDLE_BACKOFF_SECONDS = max(5, env_int("IDLE_BACKOFF_SECONDS", 10))
+SCHEDULER_TICK_SECONDS = max(1, env_int("SCHEDULER_TICK_SECONDS", 5))
+MAX_SCHEDULE_SECONDS = max(3600, env_int("MAX_SCHEDULE_SECONDS", 7 * 86400))
+
+
+if not API_ID or not API_HASH:
+    raise RuntimeError("API_ID/API_HASH missing.")
+if not FOLDER_TARGET_NAME:
+    raise RuntimeError("FOLDER_TARGET_NAME is required.")
+if not TARGET_MAIN_CHANNEL:
+    raise RuntimeError("TARGET_MAIN_CHANNEL is required.")
+if not JARVIS_WEB_TOKEN:
+    raise RuntimeError("JARVIS_WEB_TOKEN is required for protected web APIs.")
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("jarvis")
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
 
-app = Quart("devil_cross_app", root_path=".")
 
-API_ID = int(os.environ.get("API_ID", 36094172))
-API_HASH = os.environ.get("API_HASH", "ff6eee1bcccf82daea88c63c45b6b546")
-SESSION_STRING = os.environ.get("SESSION_STRING")
+def iso(dt: datetime | None) -> str | None:
+    return dt.astimezone(timezone.utc).isoformat() if dt else None
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
-TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", "-1001716302260"))
-FOLDER_TARGET_NAME = os.environ.get("FOLDER_TARGET_NAME", "RAN X CROXX")
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
-# Authorized users string (comma separated IDs)
-AUTH_USERS_ENV = os.environ.get("AUTHORIZED_USERS", "")
-AUTHORIZED_USER_IDS = set()
-if AUTH_USERS_ENV:
-    for u in AUTH_USERS_ENV.split(","):
-        if u.strip().lstrip('-').isdigit():
-            AUTHORIZED_USER_IDS.add(int(u.strip()))
 
-# Database files
-DB_FILE_NAME = os.environ.get("DB_FILE_NAME", "devil_analytics_acc2.json")
-DB_FILE = f"/data/{DB_FILE_NAME}" if os.path.exists("/data") else DB_FILE_NAME
-JARVIS_STATE_FILE = f"/data/jarvis_state.json" if os.path.exists("/data") else "jarvis_state.json"
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# ============================================================
+# APPLICATION / TELEGRAM
+# ============================================================
+
+app = Quart(__name__)
 
 if SESSION_STRING:
-    client = TelegramClient(StringSession(SESSION_STRING.strip()), API_ID, API_HASH)
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 else:
-    client = TelegramClient("devil_main_session_acc2", API_ID, API_HASH)
+    session_path = STATE_DIR / SESSION_NAME
+    client = TelegramClient(str(session_path), API_ID, API_HASH)
 
 
-# ========================================================
-# GLOBAL STATE (DEVIL ENGINE)
-# ========================================================
+# ============================================================
+# GLOBAL RUNTIME STATE
+# ============================================================
+
 CROSS_LOOP_RUNNING = False
-LOOP_END_TIME = None
-MEMORY_CACHE = {}
-CHANNELS_QUEUE = []
-PERMANENT_BAD_CHANNELS = set()
-CURRENT_SOURCE_MSGS = []
-ME_ID = None
-RUN_TASK = None
+LOOP_END_TIME: datetime | None = None
+CHANNELS_QUEUE: list[int] = []
+DEFERRED_QUEUE: dict[str, dict[str, Any]] = {}
+PERMANENT_BAD_CHANNELS: set[int] = set()
+CURRENT_SOURCE_MSGS: list[Any] = []
+CURRENT_SOURCE_CHAT_ID: int | None = None
+ME_ID: int | None = None
+RUN_TASK: asyncio.Task | None = None
+SCHEDULER_TASK: asyncio.Task | None = None
+AI_BUSY = False
+AI_LAST_DECISION: dict[str, Any] | None = None
+AI_LAST_RESULT: str | None = None
+STARTED_AT: datetime | None = None
+LAST_ERROR: str | None = None
 
-status_tracker = {
-    "total": 0, "completed": 0, "skipped": 0,
-    "remaining": 0, "current_channel": "None", "timer_end": "None",
+status_tracker: dict[str, Any] = {
+    "total": 0,
+    "completed": 0,
+    "skipped": 0,
+    "remaining": 0,
+    "current_channel": "None",
+    "timer_end": "None",
+    "last_action": None,
 }
 
-LINK_RESOLVE_CACHE = {}
+LINK_RESOLVE_CACHE: dict[str, tuple[float, Any]] = {}
+
+engine_lock = asyncio.Lock()
+state_lock = asyncio.Lock()
+ai_lock = asyncio.Lock()
+
+file_lock = threading.RLock()
 
 
-# ========================================================
-# DATA MODELS (JARVIS)
-# ========================================================
-@dataclass
-class JarvisJob:
-    id: str
-    action: str
-    params: Dict[str, Any]
-    run_at_epoch: float
-    status: str  # pending, completed, failed
-    created_at_epoch: float
-    reply_to_msg_id: Optional[int] = None
-    chat_id: Optional[int] = None
+# ============================================================
+# PERSISTENT STATE
+# ============================================================
 
-# ========================================================
-# LOGGING, DIAGNOSTICS & ERROR TRACKING
-# ========================================================
-class JarvisDiagnostics:
-    def __init__(self):
-        self.uptime_start = time.time()
-        self.jobs_executed = 0
-        self.errors = []
-
-    def log_error(self, component: str, error_msg: str):
-        print(f"⚠️ [{component} ERROR] {error_msg}")
-        self.errors.append({
-            "time": get_local_now().strftime("%Y-%m-%d %H:%M:%S"),
-            "component": component,
-            "error": error_msg
-        })
-        # Keep last 50 errors
-        if len(self.errors) > 50:
-            self.errors.pop(0)
-
-    def get_health_report(self):
-        uptime = time.time() - self.uptime_start
-        return {
-            "uptime_seconds": uptime,
-            "jobs_executed": self.jobs_executed,
-            "recent_errors_count": len(self.errors),
-            "healthy": len(self.errors) < 10
-        }
-
-DIAGNOSTICS = JarvisDiagnostics()
-
-
-# ========================================================
-# PERSISTENT STATE & ATOMIC SAVE/LOAD
-# ========================================================
-JARVIS_STATE = {
-    "jobs": []
+DEFAULT_STATE: dict[str, Any] = {
+    "schema_version": SCHEMA_VERSION,
+    "engine": {
+        "running": False,
+        "end_time": None,
+    },
+    "queue": [],
+    "deferred_queue": {},
+    "permanent_bad_channels": [],
+    "source": {
+        "chat_id": None,
+        "message_ids": [],
+    },
+    "scheduler_jobs": [],
+    "confirmations": {},
+    "analytics": {},
+    "runtime": {
+        "total_processed": 0,
+        "total_skipped": 0,
+        "current_channel": "None",
+        "last_error": None,
+        "started_at": None,
+    },
 }
 
-def load_jarvis_state():
-    global JARVIS_STATE
-    if os.path.exists(JARVIS_STATE_FILE):
-        try:
-            with open(JARVIS_STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                JARVIS_STATE["jobs"] = [JarvisJob(**job) for job in data.get("jobs", [])]
-        except Exception as e:
-            DIAGNOSTICS.log_error("STATE_LOAD", str(e))
-            JARVIS_STATE["jobs"] = []
 
-def save_jarvis_state():
-    try:
-        folder = os.path.dirname(JARVIS_STATE_FILE)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-            
-        temp_file = f"{JARVIS_STATE_FILE}.tmp"
-        serializable_state = {
-            "jobs": [asdict(job) for job in JARVIS_STATE["jobs"]]
+def deepcopy_json(data: Any) -> Any:
+    return json.loads(json.dumps(data, ensure_ascii=False))
+
+
+def normalize_state(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return deepcopy_json(DEFAULT_STATE)
+
+    if raw.get("schema_version") != SCHEMA_VERSION:
+        analytics: dict[str, Any] = {}
+        for key, value in raw.items():
+            if key == "saved_queue_state":
+                continue
+            if isinstance(value, dict):
+                analytics[key] = value
+        migrated = deepcopy_json(DEFAULT_STATE)
+        migrated["analytics"] = analytics
+        old_queue = raw.get("saved_queue_state", [])
+        migrated["queue"] = [safe_int(x) for x in old_queue if str(x).lstrip("-").isdigit()]
+        return migrated
+
+    state = deepcopy_json(DEFAULT_STATE)
+    for key in state:
+        if key in raw:
+            state[key] = raw[key]
+
+    if not isinstance(state["engine"], dict):
+        state["engine"] = deepcopy_json(DEFAULT_STATE["engine"])
+    if not isinstance(state["queue"], list):
+        state["queue"] = []
+    if not isinstance(state["deferred_queue"], dict):
+        state["deferred_queue"] = {}
+    if not isinstance(state["permanent_bad_channels"], list):
+        state["permanent_bad_channels"] = []
+    if not isinstance(state["source"], dict):
+        state["source"] = deepcopy_json(DEFAULT_STATE["source"])
+    if not isinstance(state["source"].get("message_ids"), list):
+        state["source"]["message_ids"] = []
+    if not isinstance(state["scheduler_jobs"], list):
+        state["scheduler_jobs"] = []
+    if not isinstance(state["confirmations"], dict):
+        state["confirmations"] = {}
+    if not isinstance(state["analytics"], dict):
+        state["analytics"] = {}
+    if not isinstance(state["runtime"], dict):
+        state["runtime"] = deepcopy_json(DEFAULT_STATE["runtime"])
+
+    return state
+
+
+def load_state_sync() -> dict[str, Any]:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock:
+        if not STATE_FILE.exists():
+            state = deepcopy_json(DEFAULT_STATE)
+            save_state_sync(state)
+            return state
+
+        try:
+            raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            return normalize_state(raw)
+        except Exception as primary_exc:
+            logger.error("[STORAGE] State file is invalid: %s", primary_exc)
+            backup = STATE_FILE.with_suffix(STATE_FILE.suffix + ".bak")
+            if backup.exists():
+                try:
+                    raw = json.loads(backup.read_text(encoding="utf-8"))
+                    logger.warning("[STORAGE] Recovered state from backup file")
+                    return normalize_state(raw)
+                except Exception as backup_exc:
+                    logger.error("[STORAGE] Backup state is also invalid: %s", backup_exc)
+            return deepcopy_json(DEFAULT_STATE)
+
+
+def save_state_sync(state: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = normalize_state(state)
+    temp_file = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    backup = STATE_FILE.with_suffix(STATE_FILE.suffix + ".bak")
+
+    with file_lock:
+        if STATE_FILE.exists():
+            try:
+                backup.write_bytes(STATE_FILE.read_bytes())
+            except Exception:
+                logger.warning("[STORAGE] Could not refresh state backup", exc_info=True)
+        temp_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temp_file, STATE_FILE)
+
+
+def state_snapshot_sync() -> dict[str, Any]:
+    return load_state_sync()
+
+
+def persist_runtime_state() -> None:
+    state = state_snapshot_sync()
+    state["schema_version"] = SCHEMA_VERSION
+    state["engine"]["running"] = CROSS_LOOP_RUNNING
+    state["engine"]["end_time"] = iso(LOOP_END_TIME)
+    state["queue"] = list(CHANNELS_QUEUE)
+    state["deferred_queue"] = deepcopy_json(DEFERRED_QUEUE)
+    state["permanent_bad_channels"] = sorted(PERMANENT_BAD_CHANNELS)
+    state["source"] = {
+        "chat_id": CURRENT_SOURCE_CHAT_ID,
+        "message_ids": [getattr(m, "id", 0) for m in CURRENT_SOURCE_MSGS],
+    }
+    state["runtime"] = {
+        "total_processed": status_tracker.get("completed", 0),
+        "total_skipped": status_tracker.get("skipped", 0),
+        "current_channel": status_tracker.get("current_channel", "None"),
+        "last_error": LAST_ERROR,
+        "started_at": iso(STARTED_AT),
+    }
+    save_state_sync(state)
+
+
+def get_analytics_sync() -> dict[str, Any]:
+    return load_state_sync().get("analytics", {})
+
+
+def save_analytics_sync(analytics: dict[str, Any]) -> None:
+    state = load_state_sync()
+    state["analytics"] = analytics
+    save_state_sync(state)
+
+
+def update_analytics(channel_id: int, title: str, pending_request_delta: int) -> None:
+    analytics = get_analytics_sync()
+    key = str(channel_id)
+    entry = analytics.get(key)
+    if not isinstance(entry, dict):
+        entry = {
+            "title": title,
+            "runs": 0,
+            "total_joins": 0,
+            "time_history": [],
         }
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(serializable_state, f, indent=2)
-        os.replace(temp_file, JARVIS_STATE_FILE)
-    except Exception as e:
-        DIAGNOSTICS.log_error("STATE_SAVE", str(e))
+        analytics[key] = entry
 
-def load_analytics():
-    global MEMORY_CACHE
-    if MEMORY_CACHE:
-        return MEMORY_CACHE
-    if os.path.exists(DB_FILE):
+    entry.setdefault("title", title)
+    entry.setdefault("runs", 0)
+    entry.setdefault("total_joins", 0)
+    entry.setdefault("time_history", [])
+    entry["title"] = title or entry["title"]
+    entry["runs"] = safe_int(entry["runs"]) + 1
+    entry["total_joins"] = safe_int(entry["total_joins"]) + max(0, pending_request_delta)
+    entry["time_history"].append({
+        "timestamp": now_local().strftime("%Y-%m-%d %H:%M:%S"),
+        "hour": now_local().strftime("%I:%M %p"),
+        "pending_request_delta": max(0, pending_request_delta),
+    })
+    entry["time_history"] = entry["time_history"][-200:]
+    save_analytics_sync(analytics)
+
+
+def load_runtime_from_state() -> None:
+    global CROSS_LOOP_RUNNING, LOOP_END_TIME, CHANNELS_QUEUE
+    global DEFERRED_QUEUE, PERMANENT_BAD_CHANNELS, CURRENT_SOURCE_CHAT_ID
+    global STARTED_AT, LAST_ERROR
+
+    state = load_state_sync()
+    engine = state["engine"]
+    CROSS_LOOP_RUNNING = bool(engine.get("running", False))
+    LOOP_END_TIME = parse_iso(engine.get("end_time"))
+    CHANNELS_QUEUE = [safe_int(x) for x in state["queue"] if safe_int(x) != 0]
+    DEFERRED_QUEUE = state["deferred_queue"]
+    PERMANENT_BAD_CHANNELS = {safe_int(x) for x in state["permanent_bad_channels"] if safe_int(x) != 0}
+    CURRENT_SOURCE_CHAT_ID = safe_int(state["source"].get("chat_id"), 0) or None
+    STARTED_AT = parse_iso(state["runtime"].get("started_at"))
+    LAST_ERROR = state["runtime"].get("last_error")
+
+    status_tracker["completed"] = safe_int(state["runtime"].get("total_processed"))
+    status_tracker["skipped"] = safe_int(state["runtime"].get("total_skipped"))
+    status_tracker["remaining"] = len(CHANNELS_QUEUE)
+    status_tracker["current_channel"] = state["runtime"].get("current_channel", "None")
+    status_tracker["timer_end"] = LOOP_END_TIME.strftime("%I:%M %p (%d-%b)") if LOOP_END_TIME else (
+        "24/7 Unlimited Mode" if CROSS_LOOP_RUNNING else "None"
+    )
+
+
+async def save_runtime_state() -> None:
+    async with state_lock:
+        await asyncio.to_thread(persist_runtime_state)
+
+
+# ============================================================
+# TELEGRAM ERROR HANDLING
+# ============================================================
+
+class PermissionDenied(Exception):
+    pass
+
+
+class FloodWaitExceeded(Exception):
+    pass
+
+
+async def tg_call(func, *args, retries: int = 3, **kwargs):
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
         try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                MEMORY_CACHE = json.load(f)
-                return MEMORY_CACHE
-        except Exception as e:
-            DIAGNOSTICS.log_error("ANALYTICS_LOAD", str(e))
-    MEMORY_CACHE = {}
-    return MEMORY_CACHE
-
-def save_analytics(data):
-    global MEMORY_CACHE
-    MEMORY_CACHE = data
-    try:
-        folder = os.path.dirname(DB_FILE)
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        temp_file = f"{DB_FILE}.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(temp_file, DB_FILE)
-    except Exception as e:
-        DIAGNOSTICS.log_error("ANALYTICS_SAVE", str(e))
-
-def save_queue_state(queue_list):
-    db = load_analytics()
-    db["saved_queue_state"] = list(queue_list)
-    save_analytics(db)
-
-def get_saved_queue_state():
-    db = load_analytics()
-    value = db.get("saved_queue_state", [])
-    return value if isinstance(value, list) else []
-
-# ========================================================
-# AUTHORIZATION
-# ========================================================
-def is_authorized(user_id: int) -> bool:
-    if ME_ID and user_id == ME_ID:
-        return True
-    if user_id in AUTHORIZED_USER_IDS:
-        return True
-    return False
-
-
-# ========================================================
-# SAFE TELEGRAM API
-# ========================================================
-async def safe_api_call(coro_func, *args, retries=3, **kwargs):
-    attempt = 0
-    while attempt < retries:
-        try:
-            return await coro_func(*args, **kwargs)
-        except errors.FloodWaitError as e:
-            attempt += 1
-            wait_time = max(0, int(e.seconds))
-            DIAGNOSTICS.log_error("API_FLOOD", f"Sleeping {wait_time}s")
-            await asyncio.sleep(wait_time)
-            if attempt >= retries:
-                return None
+            return await func(*args, **kwargs)
+        except errors.FloodWaitError as exc:
+            wait_seconds = max(0, int(exc.seconds))
+            logger.warning(
+                "[TELEGRAM] FloodWait: waiting exactly %ss (attempt %s/%s)",
+                wait_seconds,
+                attempt,
+                retries,
+            )
+            await asyncio.sleep(wait_seconds)
+            last_error = exc
+            if attempt == retries:
+                raise FloodWaitExceeded(
+                    f"Telegram FloodWait persisted after {retries} attempts ({wait_seconds}s requested)."
+                ) from exc
         except (
             errors.ChatAdminRequiredError,
             errors.ChannelPrivateError,
             errors.ChatWriteForbiddenError,
             errors.UserBannedInChannelError,
-        ):
-            return "PERMISSION_ERROR"
-        except Exception as e:
-            DIAGNOSTICS.log_error("API_CALL", str(e))
-            return None
-    return None
+            errors.UserNotParticipantError,
+        ) as exc:
+            raise PermissionDenied(str(exc)) from exc
+        except (errors.RPCError, OSError) as exc:
+            last_error = exc
+            if attempt == retries:
+                raise
+            logger.warning(
+                "[TELEGRAM] RPC/connection error; retrying %s/%s: %s",
+                attempt,
+                retries,
+                exc,
+            )
+            await asyncio.sleep(min(2 * attempt, 5))
+    if last_error:
+        raise last_error
+    raise RuntimeError("Telegram call failed without an exception")
 
 
-# ========================================================
-# RULE ENGINE & PREFLIGHT CHECKER
-# ========================================================
-class PreflightChecker:
-    @staticmethod
-    def can_start_cross() -> tuple[bool, str]:
-        if CROSS_LOOP_RUNNING:
-            return False, "Cross loop is already running."
-        if not CURRENT_SOURCE_MSGS:
-            return False, "No source messages available. Please manually run `/cross start` replying to a message once to cache the payload."
-        return True, "Preflight clear."
-
-    @staticmethod
-    def can_stop_cross() -> tuple[bool, str]:
-        if not CROSS_LOOP_RUNNING:
-            return False, "Cross loop is already stopped."
-        return True, "Preflight clear."
-
-PREFLIGHT = PreflightChecker()
+# ============================================================
+# TELEGRAM HELPERS / LINK ENGINE
+# ============================================================
 
 
-# ========================================================
-# SAFE TOOL REGISTRY & APPLICATION/CROSS CONTROL
-# ========================================================
-async def tool_start_cross(params: Dict[str, Any]) -> str:
-    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, LOOP_END_TIME
-    
-    can_run, reason = PREFLIGHT.can_start_cross()
-    if not can_run:
-        return f"Start aborted: {reason}"
+def clean_url(url: str) -> str:
+    if not url:
+        return ""
+    value = str(url).strip()
+    if value.startswith("ps://"):
+        value = "htt" + value
+    elif value.startswith("tps://"):
+        value = "ht" + value
+    elif value.startswith("s://"):
+        value = "http" + value
 
-    duration_sec = params.get("duration_seconds")
-    if duration_sec:
-        LOOP_END_TIME = get_local_now() + timedelta(seconds=duration_sec)
-        status_tracker["timer_end"] = LOOP_END_TIME.strftime("%I:%M %p (%d-%b)")
-    else:
-        LOOP_END_TIME = None
-        status_tracker["timer_end"] = "24/7 Unlimited Mode"
-
-    saved_q = get_saved_queue_state()
-    if saved_q:
-        CHANNELS_QUEUE = saved_q
-    else:
-        channels = await get_folder_channels_safely(FOLDER_TARGET_NAME)
-        if not channels:
-            return f"Error: Folder '{FOLDER_TARGET_NAME}' is empty."
-        CHANNELS_QUEUE = list(channels)
-
-    CROSS_LOOP_RUNNING = True
-    status_tracker.update({
-        "total": len(CHANNELS_QUEUE),
-        "completed": 0, "skipped": 0,
-        "remaining": len(CHANNELS_QUEUE),
-        "current_channel": "None",
-    })
-
-    start_cross_task(CURRENT_SOURCE_MSGS)
-    return "Cross-promotion loop successfully started."
-
-async def tool_stop_cross(params: Dict[str, Any]) -> str:
-    can_run, reason = PREFLIGHT.can_stop_cross()
-    if not can_run:
-        return f"Stop aborted: {reason}"
-    
-    await stop_cross_task(save=True)
-    return "Cross-promotion loop successfully stopped and state saved."
-
-async def tool_get_status(params: Dict[str, Any]) -> str:
-    status_str = "RUNNING" if CROSS_LOOP_RUNNING else "IDLE"
-    return f"Engine is currently {status_str}. Queue remaining: {len(CHANNELS_QUEUE)}. Current target: {status_tracker['current_channel']}."
-
-TOOL_REGISTRY = {
-    "start_cross": tool_start_cross,
-    "stop_cross": tool_stop_cross,
-    "get_status": tool_get_status,
-}
+    match = re.search(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(.*)", value, re.I)
+    if match:
+        return f"https://t.me/{match.group(1)}"
+    if value.startswith("@"):
+        return f"https://t.me/{value[1:]}"
+    return value
 
 
-# ========================================================
-# CONFIRMATION & ALERT SYSTEM
-# ========================================================
-async def send_alert(chat_id: int, message: str, reply_to: Optional[int] = None):
-    try:
-        await safe_api_call(
-            client.send_message,
-            chat_id,
-            message,
-            reply_to=reply_to
+def extract_link_token(link: str) -> str:
+    value = clean_url(link).rstrip("/")
+    match = re.search(
+        r"(?:t\.me|telegram\.me)/(?:\+|joinchat/|addlist/)?([\w\-]+)",
+        value,
+        re.I,
+    )
+    if match:
+        return match.group(1).lower()
+    if value.startswith("@"):
+        return value[1:].lower()
+    return value.lower()
+
+
+def slice_utf16(text: str, offset: int, length: int) -> str:
+    raw = text.encode("utf-16-le")
+    start = max(0, offset) * 2
+    end = start + max(0, length) * 2
+    return raw[start:end].decode("utf-16-le", errors="ignore")
+
+
+def extract_links_from_message(msg: Any) -> list[str]:
+    links: list[str] = []
+    if not msg:
+        return links
+
+    if getattr(msg, "reply_markup", None):
+        try:
+            for row in getattr(msg.reply_markup, "rows", []):
+                for button in getattr(row, "buttons", []):
+                    url = getattr(button, "url", None)
+                    if url:
+                        links.append(clean_url(url))
+        except Exception:
+            logger.debug("[LINK] Failed to inspect buttons", exc_info=True)
+
+    raw_text = getattr(msg, "raw_text", "") or getattr(msg, "message", "") or ""
+    for entity in getattr(msg, "entities", None) or []:
+        try:
+            if isinstance(entity, MessageEntityTextUrl):
+                url = getattr(entity, "url", None)
+                if url:
+                    links.append(clean_url(url))
+            elif isinstance(entity, MessageEntityUrl):
+                value = slice_utf16(raw_text, entity.offset, entity.length)
+                if value:
+                    links.append(clean_url(value))
+        except Exception:
+            logger.debug("[LINK] Entity parsing failed", exc_info=True)
+
+    if raw_text:
+        pattern = (
+            r"(?:https?://|ps://|tps://|s://)?(?:www\.)?"
+            r"(?:t\.me|telegram\.me)/"
+            r"(?:\+[\w\-]+|joinchat/[\w\-]+|addlist/[\w\-]+|[\w\-]+)"
         )
-    except Exception as e:
-        DIAGNOSTICS.log_error("ALERT_SYSTEM", str(e))
+        links.extend(clean_url(x) for x in re.findall(pattern, raw_text, re.I))
+        links.extend(f"https://t.me/{x}" for x in re.findall(r"(?<!\w)@([\w\-]+)", raw_text))
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for link in links:
+        token = extract_link_token(link)
+        if token and token not in seen:
+            seen.add(token)
+            unique.append(clean_url(link))
+    return unique
 
 
-# ========================================================
-# SCHEDULER & BACKGROUND TASKS
-# ========================================================
-async def jarvis_scheduler_loop():
-    print("🤖 JARVIS Scheduler Background Task Started.")
+async def resolve_link_id(link: str) -> int | str:
+    token = extract_link_token(link)
+    if not token:
+        return "UNKNOWN"
+
+    cached = LINK_RESOLVE_CACHE.get(token)
+    if cached and time.monotonic() - cached[0] < 900:
+        return cached[1]
+
+    resolved: int | str = "UNKNOWN"
+    try:
+        invite = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w\-]+)", link, re.I)
+        if invite:
+            result = await tg_call(client, CheckChatInviteRequest, invite.group(1), retries=2)
+            if isinstance(result, (ChatInviteAlready, ChatInvite)):
+                chat = getattr(result, "chat", None)
+                resolved = getattr(chat, "id", "UNKNOWN") if chat else "UNKNOWN"
+        elif "addlist/" in link.lower():
+            resolved = "UNKNOWN"
+        else:
+            entity = await tg_call(client.get_entity, link, retries=2)
+            resolved = getattr(entity, "id", "UNKNOWN")
+    except (PermissionDenied, FloodWaitExceeded, errors.RPCError):
+        resolved = "UNKNOWN"
+    except Exception:
+        logger.debug("[LINK] Entity resolution failed for %s", token, exc_info=True)
+        resolved = "UNKNOWN"
+
+    if isinstance(resolved, int):
+        resolved = abs(resolved)
+    LINK_RESOLVE_CACHE[token] = (time.monotonic(), resolved)
+    return resolved
+
+
+@dataclass
+class Eligibility:
+    state: Literal["eligible", "defer", "blocked", "skip"]
+    target_link: str | None = None
+    reason: str = ""
+
+
+async def verify_channel_eligibility(entity: Any, messages: list[Any], bio: str) -> Eligibility:
+    current_id = abs(safe_int(getattr(entity, "id", 0)))
+    blacklist = (
+        "no link",
+        "no cross",
+        "admin remove",
+        "cross off",
+        "no promo",
+        "link not allowed",
+    )
+
+    for msg in messages:
+        text = (getattr(msg, "raw_text", "") or getattr(msg, "message", "") or "").lower()
+        if any(word in text for word in blacklist):
+            return Eligibility("blocked", reason="blacklist phrase")
+
+    candidates: list[str] = []
+    for msg in messages:
+        candidates.extend(extract_links_from_message(msg))
+
+    seen: set[str] = set()
+    for link in candidates:
+        token = extract_link_token(link)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        resolved_id = await resolve_link_id(link)
+        if resolved_id == current_id:
+            return Eligibility("defer", target_link=clean_url(link), reason="channel already contains its own link")
+        if resolved_id == "UNKNOWN":
+            return Eligibility("defer", reason="unresolved Telegram link")
+        return Eligibility("blocked", reason="another Telegram link already present")
+
+    if bio:
+        dummy = type("Dummy", (), {"raw_text": bio, "message": bio, "reply_markup": None, "entities": None})()
+        for link in extract_links_from_message(dummy):
+            resolved_id = await resolve_link_id(link)
+            if resolved_id == current_id:
+                return Eligibility("defer", target_link=clean_url(link), reason="own link in bio")
+            if resolved_id == "UNKNOWN":
+                return Eligibility("defer", reason="unresolved Telegram link in bio")
+            return Eligibility("blocked", reason="another Telegram link in bio")
+
+    username = getattr(entity, "username", None)
+    if username:
+        return Eligibility("eligible", target_link=f"https://t.me/{username}")
+    return Eligibility("skip", reason="channel has no public username")
+
+
+async def get_folder_channels(folder_name: str) -> list[int]:
+    result = await tg_call(client, GetDialogFiltersRequest, retries=2)
+    filters = getattr(result, "filters", result) or []
+    target = folder_name.strip().lower()
+    excluded: set[int] = set()
+    included: set[int] = set()
+
+    for dialog_filter in filters:
+        if not isinstance(dialog_filter, DialogFilter):
+            continue
+        title_obj = getattr(dialog_filter, "title", None)
+        title = str(getattr(title_obj, "text", title_obj) or "").strip().lower()
+        if title != target:
+            continue
+
+        for peer in list(getattr(dialog_filter, "exclude_peers", []) or []):
+            cid = getattr(peer, "channel_id", None)
+            if cid:
+                excluded.add(int(cid))
+        for peer in list(getattr(dialog_filter, "include_peers", []) or []):
+            cid = getattr(peer, "channel_id", None)
+            if cid:
+                included.add(int(cid))
+        for peer in list(getattr(dialog_filter, "pinned_peers", []) or []):
+            cid = getattr(peer, "channel_id", None)
+            if cid:
+                included.add(int(cid))
+
+    return sorted(included - excluded)
+
+
+async def get_pending_requests(channel: Any) -> int | None:
+    try:
+        full = await tg_call(client, GetFullChannelRequest, channel, retries=2)
+        if isinstance(full, str):
+            return None
+        value = getattr(full.full_chat, "requests_pending", None)
+        return safe_int(value) if value is not None else 0
+    except Exception as exc:
+        logger.warning("[ANALYTICS] Pending request check failed: %s", exc)
+        return None
+
+
+# ============================================================
+# QUEUE / DEFERRED QUEUE
+# ============================================================
+
+
+def add_deferred(channel_id: int, reason: str) -> None:
+    key = str(channel_id)
+    item = DEFERRED_QUEUE.get(key, {})
+    DEFERRED_QUEUE[key] = {
+        "channel_id": channel_id,
+        "attempts": safe_int(item.get("attempts")) + 1,
+        "reason": reason[:300],
+        "retry_after": iso(now_utc() + timedelta(seconds=DEFERRED_RECHECK_SECONDS)),
+        "updated_at": iso(now_utc()),
+    }
+
+
+def pop_due_deferred() -> list[int]:
+    due: list[int] = []
+    current = now_utc()
+    for key, item in list(DEFERRED_QUEUE.items()):
+        retry_after = parse_iso(item.get("retry_after")) if isinstance(item, dict) else None
+        if retry_after is None or retry_after <= current:
+            cid = safe_int(item.get("channel_id"), safe_int(key)) if isinstance(item, dict) else safe_int(key)
+            if cid:
+                due.append(cid)
+            DEFERRED_QUEUE.pop(key, None)
+    return due
+
+
+def queue_unique(channels: list[int]) -> None:
+    existing = set(CHANNELS_QUEUE)
+    for channel_id in channels:
+        if channel_id in existing or channel_id in PERMANENT_BAD_CHANNELS:
+            continue
+        if str(channel_id) in DEFERRED_QUEUE:
+            continue
+        if channel_id == abs(TARGET_MAIN_CHANNEL):
+            continue
+        CHANNELS_QUEUE.append(channel_id)
+        existing.add(channel_id)
+
+
+# ============================================================
+# SOURCE MESSAGE RECOVERY
+# ============================================================
+
+async def recover_source_messages() -> bool:
+    global CURRENT_SOURCE_MSGS, CURRENT_SOURCE_CHAT_ID
+    state = load_state_sync()
+    chat_id = safe_int(state["source"].get("chat_id"), 0) or None
+    message_ids = [safe_int(x) for x in state["source"].get("message_ids", []) if safe_int(x)]
+    if not chat_id or not message_ids:
+        CURRENT_SOURCE_MSGS = []
+        CURRENT_SOURCE_CHAT_ID = None
+        return False
+
+    try:
+        messages = await tg_call(client.get_messages, chat_id, ids=message_ids, retries=2)
+        if not isinstance(messages, list):
+            messages = [messages] if messages else []
+        messages = [m for m in messages if getattr(m, "id", None)]
+        found_ids = {m.id for m in messages}
+        if found_ids != set(message_ids):
+            logger.warning("[SOURCE] Some saved source messages could not be recovered")
+            return False
+        CURRENT_SOURCE_CHAT_ID = chat_id
+        CURRENT_SOURCE_MSGS = messages
+        return True
+    except Exception as exc:
+        logger.error("[SOURCE] Recovery failed: %s", exc)
+        return False
+
+
+async def configure_source_from_event(event: Any) -> tuple[bool, str]:
+    global CURRENT_SOURCE_MSGS, CURRENT_SOURCE_CHAT_ID
+    if not event.is_reply:
+        return False, "Reply to the source post to configure the source bundle."
+
+    reply = await event.get_reply_message()
+    if not reply:
+        return False, "Could not load the replied source message."
+
+    source = [reply]
+    try:
+        next_messages = await tg_call(
+            client.get_messages,
+            event.chat_id,
+            min_id=reply.id,
+            limit=2,
+            reverse=True,
+            retries=2,
+        )
+        if not isinstance(next_messages, list):
+            next_messages = [next_messages] if next_messages else []
+        for msg in next_messages:
+            text = getattr(msg, "raw_text", "") or ""
+            if text.strip().startswith("/"):
+                continue
+            if getattr(msg, "id", None):
+                source.append(msg)
+    except Exception as exc:
+        logger.warning("[SOURCE] Could not load secondary source messages: %s", exc)
+
+    CURRENT_SOURCE_MSGS = source
+    CURRENT_SOURCE_CHAT_ID = safe_int(event.chat_id)
+    await save_runtime_state()
+    return True, f"Source configured with {len(source)} message(s)."
+
+
+# ============================================================
+# ENGINE OPERATIONS
+# ============================================================
+
+
+def format_timer() -> str:
+    if LOOP_END_TIME:
+        return LOOP_END_TIME.astimezone(LOCAL_TZ).strftime("%I:%M %p (%d-%b)")
+    return "24/7 Unlimited Mode" if CROSS_LOOP_RUNNING else "None"
+
+
+async def ensure_queue_loaded() -> tuple[bool, str]:
+    global CHANNELS_QUEUE
+
+    if CHANNELS_QUEUE:
+        return True, "Saved queue loaded."
+
+    channels = await get_folder_channels(FOLDER_TARGET_NAME)
+    if not channels:
+        return False, f"Folder '{FOLDER_TARGET_NAME}' has no eligible channels."
+    queue_unique(channels)
+    await save_runtime_state()
+    return bool(CHANNELS_QUEUE), f"Loaded {len(CHANNELS_QUEUE)} channel(s)."
+
+
+async def start_engine(duration_seconds: int | None = None, *, resume: bool = True) -> tuple[bool, str]:
+    global CROSS_LOOP_RUNNING, LOOP_END_TIME, RUN_TASK, STARTED_AT
+
+    async with engine_lock:
+        if CROSS_LOOP_RUNNING:
+            return False, "Engine is already running."
+        if not CURRENT_SOURCE_MSGS:
+            recovered = await recover_source_messages()
+            if not recovered:
+                return False, "No source messages are configured. Use /cross start with a reply to configure them."
+
+        ok, message = await ensure_queue_loaded()
+        if not ok:
+            return False, message
+
+        CROSS_LOOP_RUNNING = True
+        STARTED_AT = now_utc()
+        LOOP_END_TIME = now_utc() + timedelta(seconds=duration_seconds) if duration_seconds else None
+        status_tracker["remaining"] = len(CHANNELS_QUEUE)
+        status_tracker["timer_end"] = format_timer()
+        status_tracker["last_action"] = "start"
+        await save_runtime_state()
+
+        if RUN_TASK and not RUN_TASK.done():
+            return True, "Engine marked running; existing worker is active."
+        RUN_TASK = asyncio.create_task(run_cross_loop(), name="cross-engine")
+        return True, f"Engine started. Queue: {len(CHANNELS_QUEUE)}. Timer: {format_timer()}."
+
+
+async def stop_engine(*, save: bool = True, clear_timer: bool = True) -> tuple[bool, str]:
+    global CROSS_LOOP_RUNNING, LOOP_END_TIME, RUN_TASK, STARTED_AT
+
+    async with engine_lock:
+        CROSS_LOOP_RUNNING = False
+        if clear_timer:
+            LOOP_END_TIME = None
+        STARTED_AT = None
+        status_tracker["timer_end"] = format_timer()
+        status_tracker["last_action"] = "stop"
+        if save:
+            await save_runtime_state()
+
+        task = RUN_TASK
+        RUN_TASK = None
+
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("[ENGINE] Worker shutdown failed: %s", exc, exc_info=True)
+
+    return True, "Engine stopped. Current state saved." if save else "Engine stopped."
+
+
+async def reset_engine() -> tuple[bool, str]:
+    global CHANNELS_QUEUE, DEFERRED_QUEUE, PERMANENT_BAD_CHANNELS, LOOP_END_TIME
+    global CURRENT_SOURCE_MSGS, CURRENT_SOURCE_CHAT_ID, LAST_ERROR
+
+    await stop_engine(save=False)
+    CHANNELS_QUEUE = []
+    DEFERRED_QUEUE = {}
+    PERMANENT_BAD_CHANNELS.clear()
+    LOOP_END_TIME = None
+    LAST_ERROR = None
+    status_tracker.update({
+        "total": 0,
+        "completed": 0,
+        "skipped": 0,
+        "remaining": 0,
+        "current_channel": "None",
+        "timer_end": "None",
+        "last_action": "reset",
+    })
+    CURRENT_SOURCE_MSGS = []
+    CURRENT_SOURCE_CHAT_ID = None
+    await save_runtime_state()
+    return True, "Engine reset completed. Queue, deferred queue, bad channels, and saved source were cleared."
+
+
+# ============================================================
+# ENGINE CORE
+# ============================================================
+
+async def scan_target_channel(channel_id: int) -> tuple[Any, Eligibility, str, list[Any]]:
+    strict_id = int(f"-100{channel_id}" if not str(channel_id).startswith("-100") else channel_id)
+    entity = await tg_call(client.get_entity, strict_id, retries=2)
+    if not entity:
+        raise RuntimeError("Target channel entity is unavailable")
+
+    title = getattr(entity, "title", "Channel") or "Channel"
+    messages: list[Any] = []
+    async for msg in client.iter_messages(entity, limit=4):
+        messages.append(msg)
+
+    try:
+        pinned = await tg_call(client.get_messages, entity, filter=InputMessagesFilterPinned(), limit=1, retries=2)
+        if pinned and isinstance(pinned, list):
+            messages.extend(pinned)
+    except Exception:
+        logger.debug("[ENGINE] Pinned-message scan failed for %s", title, exc_info=True)
+
+    bio = ""
+    try:
+        full = await tg_call(client, GetFullChannelRequest, entity, retries=2)
+        if not isinstance(full, str):
+            bio = getattr(full.full_chat, "about", "") or ""
+    except Exception:
+        logger.debug("[ENGINE] Bio lookup failed for %s", title, exc_info=True)
+
+    eligibility = await verify_channel_eligibility(entity, messages, bio)
+    return entity, eligibility, title, messages
+
+
+async def perform_cross_for_channel(channel_id: int) -> str:
+    if not CURRENT_SOURCE_MSGS:
+        raise RuntimeError("Source messages are not configured")
+
+    entity, eligibility, title, _ = await scan_target_channel(channel_id)
+    status_tracker["current_channel"] = title
+
+    if eligibility.state == "defer":
+        add_deferred(channel_id, eligibility.reason)
+        return "deferred"
+    if eligibility.state == "blocked":
+        PERMANENT_BAD_CHANNELS.add(channel_id)
+        status_tracker["skipped"] += 1
+        return "blocked"
+    if eligibility.state == "skip":
+        status_tracker["skipped"] += 1
+        return "skipped"
+    if not eligibility.target_link:
+        status_tracker["skipped"] += 1
+        return "skipped"
+
+    target_link = eligibility.target_link
+    forwarded_ids: list[int] = []
+    main_ids: list[int] = []
+    secondary_task: asyncio.Task | None = None
+    stop_secondary = asyncio.Event()
+
+    before_requests = await get_pending_requests(TARGET_MAIN_CHANNEL)
+
+    try:
+        first = await tg_call(
+            client.forward_messages,
+            entity,
+            CURRENT_SOURCE_MSGS[0],
+            silent=False,
+            retries=3,
+        )
+        if isinstance(first, list):
+            first = first[0] if first else None
+        first_id = getattr(first, "id", None)
+        if not first_id:
+            raise RuntimeError("Source message could not be forwarded")
+        forwarded_ids.append(first_id)
+
+        if POST_SETTLE_SECONDS:
+            await asyncio.sleep(POST_SETTLE_SECONDS)
+
+        drop_text = clean_url(target_link)
+        main_message = await tg_call(
+            client.send_message,
+            TARGET_MAIN_CHANNEL,
+            drop_text,
+            silent=True,
+            retries=3,
+        )
+        if not getattr(main_message, "id", None):
+            raise RuntimeError("Main channel promo message was not created")
+        main_ids.append(main_message.id)
+
+        async def send_secondary() -> None:
+            for msg in CURRENT_SOURCE_MSGS[1:]:
+                delay = SECONDARY_DELAY_MIN
+                if SECONDARY_DELAY_MAX > SECONDARY_DELAY_MIN:
+                    delay = SECONDARY_DELAY_MIN + int(
+                        (SECONDARY_DELAY_MAX - SECONDARY_DELAY_MIN) * (time.monotonic() % 1)
+                    )
+                if delay:
+                    try:
+                        await asyncio.wait_for(stop_secondary.wait(), timeout=delay)
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+
+                if stop_secondary.is_set() or not CROSS_LOOP_RUNNING:
+                    return
+
+                check = await tg_call(client.get_messages, entity, ids=first_id, retries=2)
+                if not check or getattr(check, "empty", False):
+                    return
+
+                try:
+                    if msg.media:
+                        sent = await tg_call(
+                            client.send_message,
+                            entity,
+                            msg.message or "",
+                            file=msg.media,
+                            reply_to=first_id,
+                            silent=False,
+                            retries=3,
+                        )
+                    else:
+                        sent = await tg_call(
+                            client.send_message,
+                            entity,
+                            msg.message or "",
+                            reply_to=first_id,
+                            silent=False,
+                            retries=3,
+                        )
+                    if getattr(sent, "id", None):
+                        forwarded_ids.append(sent.id)
+                except Exception as exc:
+                    logger.error("[ENGINE] Secondary source post failed for %s: %s", title, exc)
+                    return
+
+        if len(CURRENT_SOURCE_MSGS) > 1:
+            secondary_task = asyncio.create_task(send_secondary(), name=f"secondary-{channel_id}")
+
+        started = time.monotonic()
+        while CROSS_LOOP_RUNNING and (time.monotonic() - started) < MONITOR_SECONDS:
+            await asyncio.sleep(MONITOR_POLL_SECONDS)
+
+            check = await tg_call(client.get_messages, entity, ids=first_id, retries=2)
+            if not check or getattr(check, "empty", False):
+                break
+
+            recent_main = await tg_call(client.get_messages, TARGET_MAIN_CHANNEL, limit=8, retries=2)
+            if isinstance(recent_main, list):
+                for message in recent_main:
+                    if message.id in main_ids:
+                        continue
+                    for link in extract_links_from_message(message):
+                        if extract_link_token(link) == extract_link_token(target_link):
+                            main_ids.append(message.id)
+                            break
+
+    finally:
+        stop_secondary.set()
+        if secondary_task and not secondary_task.done():
+            secondary_task.cancel()
+            try:
+                await secondary_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("[ENGINE] Secondary task cleanup error", exc_info=True)
+
+        after_requests = await get_pending_requests(TARGET_MAIN_CHANNEL)
+        if before_requests is not None and after_requests is not None:
+            pending_delta = max(0, after_requests - before_requests)
+            update_analytics(channel_id, title, pending_delta)
+
+        if main_ids:
+            try:
+                await tg_call(client.delete_messages, TARGET_MAIN_CHANNEL, main_ids, retries=3)
+            except Exception as exc:
+                logger.error("[ENGINE] Main-message cleanup failed for %s: %s", title, exc)
+
+        if forwarded_ids:
+            try:
+                await tg_call(client.delete_messages, entity, forwarded_ids, retries=3)
+            except Exception as exc:
+                logger.error("[ENGINE] Target-message cleanup failed for %s: %s", title, exc)
+
+    return "completed"
+
+
+async def replenish_queue_for_round() -> None:
+    channels = await get_folder_channels(FOLDER_TARGET_NAME)
+    if not channels:
+        return
+    queue_unique(channels)
+    status_tracker["total"] = max(status_tracker.get("total", 0), len(CHANNELS_QUEUE))
+
+
+async def run_cross_loop() -> None:
+    global LAST_ERROR, CROSS_LOOP_RUNNING, LOOP_END_TIME
+
+    logger.info("[ENGINE] Cross worker started")
+    try:
+        while CROSS_LOOP_RUNNING:
+            if LOOP_END_TIME and now_utc() >= LOOP_END_TIME:
+                logger.info("[ENGINE] Timer expired")
+                CROSS_LOOP_RUNNING = False
+                LOOP_END_TIME = None
+                await save_runtime_state()
+                break
+
+            if not CHANNELS_QUEUE:
+                due = pop_due_deferred()
+                if due:
+                    queue_unique(due)
+                    await save_runtime_state()
+                    if CHANNELS_QUEUE:
+                        continue
+
+                if DEFERRED_QUEUE:
+                    await asyncio.sleep(DEFERRED_RECHECK_SECONDS)
+                    continue
+
+                try:
+                    await replenish_queue_for_round()
+                except Exception as exc:
+                    LAST_ERROR = f"Folder scan failed: {exc}"
+                    logger.error("[ENGINE] %s", LAST_ERROR, exc_info=True)
+                    await save_runtime_state()
+                    await asyncio.sleep(ENGINE_ROUND_RELOAD_SECONDS)
+                    continue
+
+                if not CHANNELS_QUEUE:
+                    await asyncio.sleep(ENGINE_ROUND_RELOAD_SECONDS)
+                    continue
+
+            channel_id = CHANNELS_QUEUE[0]
+            status_tracker["remaining"] = len(CHANNELS_QUEUE)
+
+            try:
+                result = await perform_cross_for_channel(channel_id)
+                if CHANNELS_QUEUE and CHANNELS_QUEUE[0] == channel_id:
+                    CHANNELS_QUEUE.pop(0)
+
+                status_tracker["remaining"] = len(CHANNELS_QUEUE)
+                if result == "completed":
+                    status_tracker["completed"] += 1
+                elif result in {"skipped", "blocked"}:
+                    pass
+
+                await save_runtime_state()
+                await asyncio.sleep(IDLE_BACKOFF_SECONDS)
+            except PermissionDenied as exc:
+                PERMANENT_BAD_CHANNELS.add(channel_id)
+                if CHANNELS_QUEUE and CHANNELS_QUEUE[0] == channel_id:
+                    CHANNELS_QUEUE.pop(0)
+                status_tracker["skipped"] += 1
+                LAST_ERROR = f"Permission denied for {channel_id}: {exc}"
+                logger.warning("[ENGINE] %s", LAST_ERROR)
+                await save_runtime_state()
+            except FloodWaitExceeded as exc:
+                LAST_ERROR = str(exc)
+                logger.error("[ENGINE] %s", LAST_ERROR)
+                await save_runtime_state()
+                CROSS_LOOP_RUNNING = False
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LAST_ERROR = f"Channel {channel_id}: {exc}"
+                logger.error("[ENGINE] Recovered from channel error: %s", exc, exc_info=True)
+                await save_runtime_state()
+                await asyncio.sleep(IDLE_BACKOFF_SECONDS)
+    except asyncio.CancelledError:
+        await save_runtime_state()
+        logger.info("[ENGINE] Cross worker cancelled safely")
+        raise
+    except Exception as exc:
+        LAST_ERROR = f"Cross worker crashed: {exc}"
+        logger.critical("[ENGINE] %s", LAST_ERROR, exc_info=True)
+        CROSS_LOOP_RUNNING = False
+        await save_runtime_state()
+    finally:
+        status_tracker["remaining"] = len(CHANNELS_QUEUE)
+        logger.info("[ENGINE] Cross worker exited")
+
+
+# ============================================================
+# SCHEDULER
+# ============================================================
+
+@dataclass
+class ScheduledJob:
+    job_id: str
+    action: str
+    params: dict[str, Any]
+    execute_at: str
+    owner_id: int
+    created_at: str
+    status: str = "pending"
+
+
+def load_jobs_sync() -> list[dict[str, Any]]:
+    return list(load_state_sync().get("scheduler_jobs", []))
+
+
+def save_jobs_sync(jobs: list[dict[str, Any]]) -> None:
+    state = load_state_sync()
+    state["scheduler_jobs"] = jobs[-500:]
+    save_state_sync(state)
+
+
+async def schedule_job(action: str, params: dict[str, Any], delay_seconds: int, owner_id: int) -> ScheduledJob:
+    if delay_seconds < 0 or delay_seconds > MAX_SCHEDULE_SECONDS:
+        raise ValueError(f"Delay must be between 0 and {MAX_SCHEDULE_SECONDS} seconds")
+
+    execute_at = now_utc() + timedelta(seconds=delay_seconds)
+    jobs = load_jobs_sync()
+
+    for raw in jobs:
+        if raw.get("status") not in {"pending", "running"}:
+            continue
+        if (
+            raw.get("action") == action
+            and safe_int(raw.get("owner_id")) == owner_id
+            and raw.get("params") == params
+            and abs((parse_iso(raw.get("execute_at")) or execute_at - timedelta(seconds=999999)).timestamp() - execute_at.timestamp()) < 5
+        ):
+            return ScheduledJob(**raw)
+
+    job = ScheduledJob(
+        job_id=uuid.uuid4().hex[:12],
+        action=action,
+        params=params,
+        execute_at=iso(execute_at) or "",
+        owner_id=owner_id,
+        created_at=iso(now_utc()) or "",
+        status="pending",
+    )
+    jobs.append(asdict(job))
+    save_jobs_sync(jobs)
+    return job
+
+
+async def notify_user(user_id: int, text: str) -> None:
+    try:
+        await tg_call(client.send_message, user_id, text, retries=2)
+    except Exception as exc:
+        logger.warning("[SCHEDULER] Could not notify owner %s: %s", user_id, exc)
+
+
+async def execute_scheduled_job(job: ScheduledJob) -> str:
+    if job.action == "START_CROSS":
+        delay = safe_int(job.params.get("duration_seconds"), 0) or None
+        ok, message = await start_engine(delay)
+        return message if ok else f"Start failed: {message}"
+    if job.action == "STOP_CROSS":
+        _, message = await stop_engine(save=True)
+        return message
+    return f"Unsupported scheduled action: {job.action}"
+
+
+async def scheduler_loop() -> None:
+    logger.info("[SCHEDULER] Started")
     while True:
         try:
-            now_epoch = time.time()
-            state_changed = False
-            
-            for job in JARVIS_STATE["jobs"]:
-                if job.status == "pending" and now_epoch >= job.run_at_epoch:
-                    # Execute Job
-                    print(f"🤖 JARVIS Executing Scheduled Job: {job.id} -> {job.action}")
-                    
-                    tool_func = TOOL_REGISTRY.get(job.action)
-                    if tool_func:
-                        try:
-                            result = await tool_func(job.params)
-                            job.status = "completed"
-                            DIAGNOSTICS.jobs_executed += 1
-                            if job.chat_id:
-                                await send_alert(
-                                    job.chat_id, 
-                                    f"✅ **JARVIS Execution Complete**\nAction: `{job.action}`\nResult: {result}",
-                                    reply_to=job.reply_to_msg_id
-                                )
-                        except Exception as e:
-                            job.status = "failed"
-                            err = traceback.format_exc()
-                            DIAGNOSTICS.log_error("SCHEDULER_EXEC", err)
-                            if job.chat_id:
-                                await send_alert(
-                                    job.chat_id, 
-                                    f"❌ **JARVIS Job Failed**\nAction: `{job.action}`\nError: {str(e)}",
-                                    reply_to=job.reply_to_msg_id
-                                )
-                    else:
-                        job.status = "failed"
-                        DIAGNOSTICS.log_error("SCHEDULER", f"Unknown action: {job.action}")
-                        
-                    state_changed = True
+            jobs = load_jobs_sync()
+            changed = False
+            now = now_utc()
 
-            if state_changed:
-                # Cleanup old jobs and save
-                JARVIS_STATE["jobs"] = [j for j in JARVIS_STATE["jobs"] if j.status == "pending" or (now_epoch - j.created_at_epoch < 86400)]
-                save_jarvis_state()
+            for raw in jobs:
+                if raw.get("status") == "running":
+                    raw["status"] = "pending"
+                    changed = True
 
+            for raw in jobs:
+                if raw.get("status") != "pending":
+                    continue
+                execute_at = parse_iso(raw.get("execute_at"))
+                if not execute_at or execute_at > now:
+                    continue
+
+                raw["status"] = "running"
+                changed = True
+                save_jobs_sync(jobs)
+
+                job = ScheduledJob(**raw)
+                try:
+                    result = await execute_scheduled_job(job)
+                    raw["status"] = "completed"
+                    await notify_user(
+                        job.owner_id,
+                        f"🧠 JARVIS scheduled job `{job.job_id}` completed.\n\n{result}",
+                    )
+                except asyncio.CancelledError:
+                    raw["status"] = "pending"
+                    save_jobs_sync(jobs)
+                    raise
+                except Exception as exc:
+                    raw["status"] = "failed"
+                    raw["error"] = str(exc)[:1000]
+                    logger.error("[SCHEDULER] Job %s failed: %s", job.job_id, exc, exc_info=True)
+                    await notify_user(
+                        job.owner_id,
+                        f"❌ JARVIS scheduled job `{job.job_id}` failed: {exc}",
+                    )
+                changed = True
+                save_jobs_sync(jobs)
+
+            if changed:
+                save_jobs_sync(jobs)
+            await asyncio.sleep(SCHEDULER_TICK_SECONDS)
         except asyncio.CancelledError:
-            break
-        except Exception as e:
-            DIAGNOSTICS.log_error("SCHEDULER_LOOP", str(e))
-        
-        await asyncio.sleep(15)  # Tick every 15 seconds
+            logger.info("[SCHEDULER] Stopped")
+            raise
+        except Exception as exc:
+            logger.error("[SCHEDULER] Loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(SCHEDULER_TICK_SECONDS)
 
 
-# ========================================================
-# JARVIS INTENT PARSER & GEMINI CLIENT
-# ========================================================
-JARVIS_PROMPT = """
-You are JARVIS, an autonomous AI assistant controlling a Telegram Cross-Promotion bot (DEVIL ENGINE).
-Your objective is to parse the user's natural language request (Hindi/English mix) and return a strictly formatted JSON intent.
+# ============================================================
+# JARVIS AI
+# ============================================================
 
-Available Actions:
-- `start_cross`: Starts the promotion loop. (e.g., "cross start kr do", "start the engine")
-- `stop_cross`: Stops the promotion loop. (e.g., "stop", "pause kr do", "sona ja rha hu cross band kr dena")
-- `get_status`: Returns current bot status. (e.g., "status kya hai", "report")
-- `report`: General conversational reply or no action needed.
-
-Parameters:
-If the user specifies a delay (e.g., "2 ghante baad", "after 30 mins"), calculate `delay_seconds`. If it should happen now, `delay_seconds` = 0.
-If they specify a duration for how long it should run, include `duration_seconds` in `params`.
-
-Current Bot State:
-- Engine Running: {engine_running}
-- Queue Length: {queue_length}
-
-OUTPUT STRICTLY VALID JSON ONLY. NO MARKDOWN. NO CODE BLOCKS.
-Format:
-{
-  "action": "<action_name>",
-  "delay_seconds": <integer>,
-  "params": {
-      "duration_seconds": <integer or null>
-  },
-  "message": "<A brief, natural reply confirming to the user what you are doing. Keep it professional.>"
+ALLOWED_ACTIONS = {
+    "REPORT",
+    "STATUS",
+    "DIAGNOSTICS",
+    "START_CROSS",
+    "STOP_CROSS",
+    "RESET_CROSS",
+    "SCHEDULE_START",
+    "SCHEDULE_STOP",
+    "SAVE_STATE",
+    "ASK_CONFIRMATION",
 }
+
+
+if BaseModel is not None:
+    class AIPlan(BaseModel):
+        action: Literal[
+            "REPORT",
+            "STATUS",
+            "DIAGNOSTICS",
+            "START_CROSS",
+            "STOP_CROSS",
+            "RESET_CROSS",
+            "SCHEDULE_START",
+            "SCHEDULE_STOP",
+            "SAVE_STATE",
+            "ASK_CONFIRMATION",
+        ]
+        reason: str = Field(default="", max_length=1000)
+        message: str = Field(default="", max_length=2000)
+        delay_seconds: int = Field(default=0, ge=0, le=604800)
+        duration_seconds: int = Field(default=0, ge=0, le=604800)
+else:
+    AIPlan = None  # type: ignore
+
+
+AI_SYSTEM_PROMPT = """
+You are JARVIS, the planning layer of a Telegram automation service.
+
+You do NOT have arbitrary code, shell, filesystem, or deployment access.
+Return exactly one action from the allowlist below.
+Never claim an action executed unless the application result says so.
+Never suggest bypassing Telegram restrictions or FloodWaits.
+
+Allowed actions:
+REPORT
+STATUS
+DIAGNOSTICS
+START_CROSS
+STOP_CROSS
+RESET_CROSS
+SCHEDULE_START
+SCHEDULE_STOP
+SAVE_STATE
+ASK_CONFIRMATION
+
+Rules:
+- 'cross start' -> START_CROSS.
+- 'cross stop' -> STOP_CROSS.
+- 'cross reset' -> RESET_CROSS.
+- 'status' -> STATUS.
+- 'diagnostics' -> DIAGNOSTICS.
+- 'after N minutes/hours/days' for starting/stopping -> SCHEDULE_START or SCHEDULE_STOP.
+- Put delays in delay_seconds.
+- Do not invent missing configuration.
+- For a clearly explicit user command, use the matching action directly.
+- Use ASK_CONFIRMATION only when the user intent is ambiguous or requests an operation outside the allowlist.
 """
 
-def extract_json_object(text):
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
+
+def parse_duration(text: str) -> int | None:
+    if not text:
         return None
-    try:
-        return json.loads(text[start:end + 1])
-    except Exception:
+    matches = re.findall(
+        r"(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)",
+        text,
+        re.I,
+    )
+    if not matches:
         return None
 
-async def parse_jarvis_intent(instruction: str) -> dict:
-    if not GEMINI_API_KEY or not genai:
+    total = 0.0
+    for value, unit in matches:
+        number = float(value)
+        unit = unit.lower()
+        if unit.startswith("s"):
+            total += number
+        elif unit.startswith("m"):
+            total += number * 60
+        elif unit.startswith("h"):
+            total += number * 3600
+        elif unit.startswith("d"):
+            total += number * 86400
+    return int(total) if total > 0 else None
+
+
+def get_ai_snapshot() -> dict[str, Any]:
+    jobs = load_jobs_sync()
+    analytics = get_analytics_sync()
+    return {
+        "time": now_local().isoformat(),
+        "engine_running": CROSS_LOOP_RUNNING,
+        "timer_end": iso(LOOP_END_TIME),
+        "queue_length": len(CHANNELS_QUEUE),
+        "deferred_count": len(DEFERRED_QUEUE),
+        "failed_count": len(PERMANENT_BAD_CHANNELS),
+        "current_channel": status_tracker.get("current_channel"),
+        "tracker": dict(status_tracker),
+        "source_configured": bool(CURRENT_SOURCE_MSGS),
+        "scheduler_jobs": [
+            {
+                "job_id": j.get("job_id"),
+                "action": j.get("action"),
+                "execute_at": j.get("execute_at"),
+                "status": j.get("status"),
+            }
+            for j in jobs[-20:]
+        ],
+        "analytics_channels": len(analytics),
+        "last_error": LAST_ERROR,
+        "last_ai_decision": AI_LAST_DECISION,
+        "last_ai_result": AI_LAST_RESULT,
+    }
+
+
+async def ask_gemini(instruction: str) -> dict[str, Any]:
+    if not GEMINI_API_KEY:
         return {
-            "action": "report",
+            "action": "REPORT",
+            "reason": "GEMINI_API_KEY is not configured.",
+            "message": "Set GEMINI_API_KEY before using AI features.",
             "delay_seconds": 0,
-            "params": {},
-            "message": "Error: Gemini API Key missing or google-genai not installed."
+            "duration_seconds": 0,
         }
-    
-    prompt = JARVIS_PROMPT.format(
-        engine_running=CROSS_LOOP_RUNNING,
-        queue_length=len(CHANNELS_QUEUE)
-    ) + f"\n\nUser Request: {instruction}"
+    if genai is None or genai_types is None or AIPlan is None:
+        return {
+            "action": "REPORT",
+            "reason": "Gemini SDK or Pydantic dependency is not installed.",
+            "message": "Install requirements.txt before using AI features.",
+            "delay_seconds": 0,
+            "duration_seconds": 0,
+        }
+
+    prompt = (
+        AI_SYSTEM_PROMPT
+        + "\nUSER INSTRUCTION:\n"
+        + instruction
+        + "\n\nAPPLICATION SNAPSHOT:\n"
+        + json.dumps(get_ai_snapshot(), ensure_ascii=False, default=str)
+    )
 
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -461,1517 +1513,439 @@ async def parse_jarvis_intent(instruction: str) -> dict:
             ai_client.models.generate_content,
             model=GEMINI_MODEL,
             contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=AIPlan,
+            ),
         )
-        decision = extract_json_object(getattr(response, "text", ""))
-        
-        if not decision:
-            return {
-                "action": "report", 
-                "delay_seconds": 0, 
-                "params": {}, 
-                "message": "I could not understand that request properly."
-            }
-        return decision
-    except Exception as e:
-        DIAGNOSTICS.log_error("GEMINI", str(e))
+        plan = AIPlan.model_validate_json(getattr(response, "text", ""))
+        data = plan.model_dump()
+        if data["action"] not in ALLOWED_ACTIONS:
+            raise ValueError("Gemini returned a non-allowlisted action")
+        data["delay_seconds"] = max(0, min(safe_int(data.get("delay_seconds")), MAX_SCHEDULE_SECONDS))
+        data["duration_seconds"] = max(0, min(safe_int(data.get("duration_seconds")), MAX_SCHEDULE_SECONDS))
+        return data
+    except Exception as exc:
+        logger.error("[GEMINI] Request/validation failed: %s", exc, exc_info=True)
         return {
-            "action": "report", 
-            "delay_seconds": 0, 
-            "params": {}, 
-            "message": f"AI Parsing Error: {str(e)}"
+            "action": "REPORT",
+            "reason": f"Gemini request failed: {exc}",
+            "message": "No automated action was executed.",
+            "delay_seconds": 0,
+            "duration_seconds": 0,
         }
 
 
-# ========================================================
-# RECOVERY SYSTEM & RESTART RECOVERY
-# ========================================================
-def jarvis_startup_recovery():
-    print("🤖 JARVIS Initializing...")
-    load_jarvis_state()
-    load_analytics()
-    
-    # Deduplicate pending jobs
-    seen = set()
-    dedup_jobs = []
-    for j in JARVIS_STATE["jobs"]:
-        if j.status == "pending":
-            key = f"{j.action}_{j.run_at_epoch}"
-            if key not in seen:
-                seen.add(key)
-                dedup_jobs.append(j)
-        else:
-            dedup_jobs.append(j)
-    JARVIS_STATE["jobs"] = dedup_jobs
-    print(f"🤖 Loaded {len([j for j in dedup_jobs if j.status == 'pending'])} pending jobs.")
+async def deterministic_ai_plan(instruction: str) -> dict[str, Any] | None:
+    text = instruction.strip().lower()
+    duration = parse_duration(text)
 
-
-# ========================================================
-# DEVIL ENGINE: TELEGRAM JOIN REQUEST ANALYTICS
-# ========================================================
-async def get_current_join_requests(target_channel):
-    try:
-        full_channel = await safe_api_call(client, GetFullChannelRequest, target_channel)
-        if full_channel and full_channel != "PERMISSION_ERROR":
-            pending = getattr(full_channel.full_chat, "requests_pending", None)
-            return 0 if pending is None else pending
-    except Exception as e:
-        DIAGNOSTICS.log_error("JOIN_REQ_CHECK", str(e))
+    if re.search(r"\b(status|state)\b", text) and not re.search(r"start|stop|reset", text):
+        return {"action": "STATUS", "reason": "Direct status command", "message": "", "delay_seconds": 0, "duration_seconds": 0}
+    if re.search(r"\bdiagnostic(s)?\b|health check", text):
+        return {"action": "DIAGNOSTICS", "reason": "Direct diagnostics command", "message": "", "delay_seconds": 0, "duration_seconds": 0}
+    if re.search(r"\bcross\s+(reset|clear)\b|\breset\s+(queue|cross)\b", text):
+        return {"action": "RESET_CROSS", "reason": "Direct reset command", "message": "", "delay_seconds": 0, "duration_seconds": 0}
+    if re.search(r"\bcross\s+(stop|halt)\b|\bstop\s+(cross|engine)\b", text):
+        if duration:
+            return {"action": "SCHEDULE_STOP", "reason": "Delayed stop request", "message": "", "delay_seconds": duration, "duration_seconds": 0}
+        return {"action": "STOP_CROSS", "reason": "Direct stop command", "message": "", "delay_seconds": 0, "duration_seconds": 0}
+    if re.search(r"\bcross\s+(start|run)\b|\bstart\s+(cross|engine)\b", text) or text.startswith("start after"):
+        if "after" in text and duration:
+            return {"action": "SCHEDULE_START", "reason": "Delayed start request", "message": "", "delay_seconds": min(duration, MAX_SCHEDULE_SECONDS), "duration_seconds": 0}
+        return {"action": "START_CROSS", "reason": "Direct start command", "message": "", "delay_seconds": 0, "duration_seconds": 0}
+    if re.search(r"save\s+(state|queue)", text):
+        return {"action": "SAVE_STATE", "reason": "Direct persistence command", "message": "", "delay_seconds": 0, "duration_seconds": 0}
     return None
 
-def update_joins_score(channel_id, channel_title, joins_gained):
-    db = load_analytics()
-    ch_key = str(channel_id)
-    now = get_local_now()
 
-    if ch_key not in db or not isinstance(db.get(ch_key), dict):
-        db[ch_key] = {"title": channel_title, "total_joins": 0, "runs": 0, "time_history": []}
-
-    entry = db[ch_key]
-    entry.setdefault("title", channel_title)
-    entry.setdefault("total_joins", 0)
-    entry.setdefault("runs", 0)
-    entry.setdefault("time_history", [])
-
-    joins_gained = max(0, int(joins_gained))
-    entry["runs"] += 1
-    entry["total_joins"] += joins_gained
-    entry["time_history"].append({
-        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "hour": now.strftime("%I:%M %p"),
-        "joins": joins_gained,
-    })
-    entry["time_history"] = entry["time_history"][-200:]
-    save_analytics(db)
-
-
-# ========================================================
-# DEVIL ENGINE: LINK ENGINE
-# ========================================================
-def clean_and_repair_url(url):
-    if not url: return ""
-    url = str(url).strip()
-    if url.startswith("ps://"): url = "htt" + url
-    elif url.startswith("tps://"): url = "ht" + url
-    elif url.startswith("s://"): url = "http" + url
-    match = re.search(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(.*)", url, re.IGNORECASE)
-    if match: return f"[https://t.me/](https://t.me/){match.group(1)}"
-    if url.startswith("@"): return f"[https://t.me/](https://t.me/){url[1:]}"
-    return url
-
-def extract_link_token(link):
-    if not link: return ""
-    clean_link = clean_and_repair_url(link).rstrip("/")
-    match = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/|addlist/)?([\w\-]+)", clean_link, re.IGNORECASE)
-    if match: return match.group(1).lower()
-    if clean_link.startswith("@"): return clean_link[1:].lower()
-    return clean_link.lower()
-
-def get_all_links_from_msg(msg):
-    links = []
-    if not msg: return links
-    if getattr(msg, "reply_markup", None):
-        try:
-            for row in getattr(msg.reply_markup, "rows", []):
-                for button in getattr(row, "buttons", []):
-                    url = getattr(button, "url", None)
-                    if url: links.append(clean_and_repair_url(url))
-        except Exception: pass
-
-    raw_text = getattr(msg, "raw_text", "") or getattr(msg, "message", "") or ""
-    if getattr(msg, "entities", None):
-        for entity in msg.entities:
-            if isinstance(entity, MessageEntityTextUrl):
-                url = getattr(entity, "url", None)
-                if url: links.append(clean_and_repair_url(url))
-            elif isinstance(entity, MessageEntityUrl):
-                try:
-                    offset, length = entity.offset, entity.length
-                    value = raw_text[offset:offset + length]
-                    if value: links.append(clean_and_repair_url(value))
-                except Exception: pass
-
-    if raw_text:
-        tg_pattern = r"(?:https?://|ps://|tps://|s://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[\w\-]+|joinchat/[\w\-]+|addlist/[\w\-]+|[\w\-]+)"
-        for match in re.findall(tg_pattern, raw_text, re.IGNORECASE): links.append(clean_and_repair_url(match))
-        for mention in re.findall(r"(?<!\w)@([\w\-]+)", raw_text): links.append(f"[https://t.me/](https://t.me/){mention}")
-
-    seen_tokens = set()
-    unique_links = []
-    for link in links:
-        link = clean_and_repair_url(link)
-        low = link.lower()
-        if "t.me/" in low or "telegram.me/" in low or low.startswith("@"):
-            token = extract_link_token(link)
-            if token and token not in seen_tokens:
-                seen_tokens.add(token)
-                unique_links.append(link)
-    return unique_links
-
-def check_duplicate_link_in_msg(msg, target_link):
-    target_token = extract_link_token(target_link)
-    if not target_token: return False
-    for link in get_all_links_from_msg(msg):
-        if target_token == extract_link_token(link): return True
-    return False
-
-async def safe_resolve_entity_id(link):
-    token = extract_link_token(link)
-    if not token: return "UNKNOWN"
-    if token in LINK_RESOLVE_CACHE: return LINK_RESOLVE_CACHE[token]
-    resolved_id = "UNKNOWN"
-    try:
-        invite_match = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w\-]+)", link, re.IGNORECASE)
-        if invite_match:
-            invite_hash = invite_match.group(1)
-            res = await safe_api_call(client, CheckChatInviteRequest, invite_hash)
-            if isinstance(res, (ChatInviteAlready, ChatInvite)):
-                chat = getattr(res, "chat", None)
-                if chat: resolved_id = getattr(chat, "id", "UNKNOWN")
-        elif "addlist/" in link.lower():
-            resolved_id = "UNKNOWN"
-        else:
-            resolved = await safe_api_call(client.get_entity, link)
-            if resolved and resolved != "PERMISSION_ERROR":
-                resolved_id = getattr(resolved, "id", "UNKNOWN")
-    except Exception:
-        resolved_id = "UNKNOWN"
-    if isinstance(resolved_id, int): resolved_id = abs(resolved_id)
-    LINK_RESOLVE_CACHE[token] = resolved_id
-    return resolved_id
-
-async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
-    current_channel_id = abs(current_channel_entity.id)
-    blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo", "link not allowed"]
-    for msg in messages_list:
-        raw_text = getattr(msg, "raw_text", "") or getattr(msg, "message", "") or ""
-        if raw_text and any(word in raw_text.lower() for word in blacklist_words):
-            return False, None
-
-    candidate_links = []
-    for msg in messages_list:
-        candidate_links.extend(get_all_links_from_msg(msg))
-
-    seen_tokens, unique_candidate_links = set(), []
-    for link in candidate_links:
-        token = extract_link_token(link)
-        if token and token not in seen_tokens:
-            seen_tokens.add(token)
-            unique_candidate_links.append(clean_and_repair_url(link))
-
-    own_links = []
-    for raw_link in unique_candidate_links:
-        resolved_id = await safe_resolve_entity_id(raw_link)
-        if resolved_id == "UNKNOWN": return False, None
-        if resolved_id == current_channel_id: own_links.append(raw_link)
-        else: return False, None
-
-    if own_links: return True, own_links[0]
-    
-    if bio_text:
-        dummy_msg = type("DummyMsg", (), {"raw_text": bio_text, "message": bio_text, "reply_markup": None, "entities": None})()
-        for link in get_all_links_from_msg(dummy_msg):
-            resolved_id = await safe_resolve_entity_id(link)
-            if resolved_id == current_channel_id: return True, clean_and_repair_url(link)
-            if resolved_id != "UNKNOWN": return False, None
-
-    username = getattr(current_channel_entity, "username", "")
-    if username: return True, f"[https://t.me/](https://t.me/){username}"
-    return True, "SKIP_DROP"
-
-
-# ========================================================
-# DEVIL ENGINE: FOLDER SCANNER & TIMERS
-# ========================================================
-async def get_folder_channels_safely(target_name):
-    channel_ids = []
-    try:
-        result = await safe_api_call(client, GetDialogFiltersRequest())
-        if not result or result == "PERMISSION_ERROR": return []
-        target_clean = str(target_name).strip().lower()
-        for dialog_filter in getattr(result, "filters", result):
-            if not isinstance(dialog_filter, DialogFilter): continue
-            title_obj = getattr(dialog_filter, "title", None)
-            folder_title = str(getattr(title_obj, "text", title_obj) or "").strip()
-            if folder_title.lower() != target_clean: continue
-            for peer in getattr(dialog_filter, "include_peers", []):
-                raw_id = getattr(peer, "channel_id", None)
-                if raw_id: channel_ids.append(int(raw_id))
-    except Exception as e:
-        DIAGNOSTICS.log_error("FOLDER_SCAN", str(e))
-    return list(dict.fromkeys(channel_ids))
-
-def parse_duration(text_args):
-    if not text_args: return None
-    match = re.search(r"(\d+)\s*(hours?|hrs?|h|minutes?|mins?|min|m|days?|d)?", text_args, re.IGNORECASE)
-    if not match: return None
-    val, unit = int(match.group(1)), (match.group(2) or "h").lower()
-    if unit.startswith("h"): return val * 3600
-    if unit.startswith("m"): return val * 60
-    if unit.startswith("d"): return val * 86400
-    return val * 3600
-
-
-# ========================================================
-# DEVIL ENGINE: CORE TASK MANAGEMENT
-# ========================================================
-def start_cross_task(source_msgs):
-    global RUN_TASK
-    if RUN_TASK and not RUN_TASK.done(): return RUN_TASK
-    RUN_TASK = asyncio.create_task(run_cross_loop(source_msgs))
-    return RUN_TASK
-
-async def stop_cross_task(save=True):
-    global RUN_TASK, CROSS_LOOP_RUNNING, LOOP_END_TIME
-    CROSS_LOOP_RUNNING = False
-    LOOP_END_TIME = None
-    if save: save_queue_state(CHANNELS_QUEUE)
-    task = RUN_TASK
-    RUN_TASK = None
-    if task and not task.done():
-        task.cancel()
-        try: await task
-        except asyncio.CancelledError: pass
-        except Exception as e: DIAGNOSTICS.log_error("TASK_STOP", str(e))
-
-
-# ========================================================
-# TELEGRAM HANDLERS & JARVIS ENTRY POINT (/ai)
-# ========================================================
-@client.on(events.NewMessage())
-async def controller(event):
-    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, CURRENT_SOURCE_MSGS, LOOP_END_TIME, PERMANENT_BAD_CHANNELS, ME_ID
-
-    if ME_ID is None:
-        try:
-            me = await client.get_me()
-            if me: ME_ID = me.id
-        except Exception: pass
-
-    # Auth block for incoming commands
-    if event.raw_text and event.raw_text.startswith("/"):
-        if not is_authorized(event.sender_id) and not event.out:
-            return
-
-    text = event.raw_text.strip() if event.raw_text else ""
-    lower_text = text.lower()
-
-    # ================= JARVIS /AI HANDLER =================
-    if lower_text.startswith("/ai"):
-        instruction = text[3:].strip()
-        if not instruction:
-            await event.reply("🤖 **JARVIS ONLINE**\n\nTell me what you need, for example:\n`/ai me sona ja rha hu, 2 ghante baad cross start kr dena`")
-            return
-        
-        reply_msg = await event.reply("🤖 *Thinking...*")
-        
-        # 1. Parse Intent
-        intent_json = await parse_jarvis_intent(instruction)
-        action = intent_json.get("action", "report")
-        delay_sec = intent_json.get("delay_seconds", 0)
-        params = intent_json.get("params", {})
-        message = intent_json.get("message", "Processed.")
-        
-        # 2. Execution vs Scheduling
-        if action == "report":
-            await reply_msg.edit(f"🤖 **JARVIS**\n\n{message}")
-        else:
-            if delay_sec > 0:
-                # Schedule Job
-                run_at = time.time() + delay_sec
-                job_id = str(uuid.uuid4())[:8]
-                new_job = JarvisJob(
-                    id=job_id,
-                    action=action,
-                    params=params,
-                    run_at_epoch=run_at,
-                    status="pending",
-                    created_at_epoch=time.time(),
-                    reply_to_msg_id=event.id,
-                    chat_id=event.chat_id
-                )
-                JARVIS_STATE["jobs"].append(new_job)
-                save_jarvis_state()
-                
-                eta = datetime.fromtimestamp(run_at, tz=LOCAL_TZ).strftime("%I:%M %p")
-                await reply_msg.edit(f"🤖 **JARVIS [Scheduled]**\n\n{message}\n\n*Task `{action}` scheduled for {eta}*")
-            else:
-                # Immediate Execution via Registry
-                tool_func = TOOL_REGISTRY.get(action)
-                if tool_func:
-                    result = await tool_func(params)
-                    DIAGNOSTICS.jobs_executed += 1
-                    await reply_msg.edit(f"🤖 **JARVIS [Executed]**\n\n{message}\n\n*Result: {result}*")
-                else:
-                    await reply_msg.edit(f"🤖 **JARVIS Error**\nUnknown action requested: `{action}`")
-        return
-
-    # ================= STANDARD COMMANDS =================
-    if lower_text.startswith("/cross start"):
-        if not event.is_reply:
-            await event.reply("⚠️ Reply to a post to set promo messages!")
-            return
-        if CROSS_LOOP_RUNNING:
-            await event.reply("⚠️ Loop is already running!")
-            return
-
-        duration_args = text[12:].strip()
-        duration_sec = parse_duration(duration_args)
-        
-        reply_msg = await event.get_reply_message()
-        source_msgs = [reply_msg]
-        try:
-            next_msgs = await safe_api_call(client.get_messages, event.chat_id, min_id=reply_msg.id, limit=2, reverse=True)
-            if next_msgs and isinstance(next_msgs, list):
-                for msg in next_msgs:
-                    if msg.raw_text and msg.raw_text.strip().lower().startswith("/"): continue
-                    source_msgs.append(msg)
-        except Exception: pass
-
-        CURRENT_SOURCE_MSGS = source_msgs
-        
-        res = await tool_start_cross({"duration_seconds": duration_sec})
-        await event.reply(f"🚀 {res}")
-        return
-
-    if lower_text.startswith("/cross stop"):
-        res = await tool_stop_cross({})
-        await event.reply(f"🛑 {res}")
-        return
-
-    if lower_text.startswith("/cross reset"):
-        await stop_cross_task(save=False)
-        CHANNELS_QUEUE = []
-        PERMANENT_BAD_CHANNELS.clear()
-        LOOP_END_TIME = None
-        save_queue_state([])
-        status_tracker.update({
-            "total": 0, "completed": 0, "skipped": 0,
-            "remaining": 0, "current_channel": "None", "timer_end":Here is the complete, production-ready `bot.py` containing the entire Devil Engine V7.0 and JARVIS integration in a single file as requested. 
-
-I have preserved all your existing Telegram logic, Quart server, queue mechanics, and cross-promo logic while building the JARVIS AI systems (Scheduler, Rule Engine, Preflight, Diagnostics, State Management) directly around them.
-
-### `bot.py`
-
-```python
-# ========================================================
-# IMPORTS
-# ========================================================
-import asyncio
-import os
-import re
-import random
-import json
-import time
-import uuid
-import traceback
-from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass, asdict
-from typing import Dict, Any, Optional, List
-
-from telethon import TelegramClient, events, errors
-from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetDialogFiltersRequest, CheckChatInviteRequest
-from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import (
-    DialogFilter, InputMessagesFilterPinned,
-    MessageEntityTextUrl, MessageEntityUrl, ChatInvite, ChatInviteAlready
-)
-from quart import Quart, jsonify, request
-
-try:
-    from google import genai
-except ImportError:
-    genai = None
-
-# ========================================================
-# CONFIGURATION
-# ========================================================
-app = Quart("devil_cross_app", root_path=".")
-LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
-
-def get_local_now():
-    return datetime.now(LOCAL_TZ)
-
-# ========================================================
-# ENVIRONMENT VARIABLES
-# ========================================================
-API_ID = int(os.environ.get("API_ID", 36094172))
-API_HASH = os.environ.get("API_HASH", "ff6eee1bcccf82daea88c63c45b6b546")
-SESSION_STRING = os.environ.get("SESSION_STRING")
-
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", -1002413253133))
-FOLDER_TARGET_NAME = os.environ.get("FOLDER_TARGET_NAME", "RAN X CROXX")
-
-DB_FILE_NAME = os.environ.get("DB_FILE_NAME", "devil_analytics_acc2.json")
-JARVIS_DB_NAME = os.environ.get("JARVIS_DB_NAME", "jarvis_state.json")
-
-DB_FILE = f"/data/{DB_FILE_NAME}" if os.path.exists("/data") else DB_FILE_NAME
-JARVIS_FILE = f"/data/{JARVIS_DB_NAME}" if os.path.exists("/data") else JARVIS_DB_NAME
-
-# Comma-separated list of Telegram User IDs allowed to use JARVIS
-AUTHORIZED_ADMINS_STR = os.environ.get("AUTHORIZED_ADMINS", "")
-
-# ========================================================
-# CONSTANTS
-# ========================================================
-MAX_RETRIES = 3
-DEFAULT_LOOP_WAIT = 15
-
-# ========================================================
-# GLOBAL STATE
-# ========================================================
-CROSS_LOOP_RUNNING = False
-LOOP_END_TIME = None
-MEMORY_CACHE = {}
-CHANNELS_QUEUE = []
-PERMANENT_BAD_CHANNELS = set()
-CURRENT_SOURCE_MSGS = []
-ME_ID = None
-RUN_TASK = None
-JARVIS_SCHEDULER_TASK = None
-ADMIN_IDS = set()
-
-status_tracker = {
-    "total": 0,
-    "completed": 0,
-    "skipped": 0,
-    "remaining": 0,
-    "current_channel": "None",
-    "timer_end": "None",
-}
-
-LINK_RESOLVE_CACHE = {}
-JARVIS_STATE_CACHE = None
-
-# ========================================================
-# DATA MODELS / DATACLASSES
-# ========================================================
-@dataclass
-class ScheduledJob:
-    job_id: str
-    intent: str
-    params: dict
-    scheduled_time: float
-    status: str  # "pending", "completed", "failed", "cancelled"
-    created_at: float
-
-@dataclass
-class SystemAlert:
-    alert_id: str
-    level: str  # "info", "warning", "critical"
-    message: str
-    timestamp: float
-
-# ========================================================
-# LOGGING & DIAGNOSTICS
-# ========================================================
-def jarvis_log(level: str, module: str, message: str):
-    timestamp = get_local_now().strftime("%Y-%m-%d %H:%M:%S")
-    log_line = f"[{timestamp}] [{level.upper()}] [{module}] {message}"
-    print(log_line)
-    if level.upper() in ["ERROR", "CRITICAL"]:
-        register_alert(level.upper(), f"[{module}] {message}")
-
-def run_diagnostics():
-    health = {
-        "engine_status": "RUNNING" if CROSS_LOOP_RUNNING else "IDLE",
-        "gemini_api": "OK" if genai else "MISSING PACKAGE",
-        "telegram_client": "CONNECTED" if client.is_connected() else "DISCONNECTED",
-        "queue_size": len(CHANNELS_QUEUE),
-        "memory_cache_loaded": bool(MEMORY_CACHE),
-    }
-    jarvis_log("INFO", "Diagnostics", f"System Health: {health}")
-    return health
-
-# ========================================================
-# PERSISTENT STATE & ATOMIC SAVE / LOAD
-# ========================================================
-def load_jarvis_state() -> dict:
-    global JARVIS_STATE_CACHE
-    if JARVIS_STATE_CACHE is not None:
-        return JARVIS_STATE_CACHE
-        
-    if os.path.exists(JARVIS_FILE):
-        try:
-            with open(JARVIS_FILE, "r", encoding="utf-8") as f:
-                JARVIS_STATE_CACHE = json.load(f)
-                return JARVIS_STATE_CACHE
-        except Exception as e:
-            jarvis_log("ERROR", "Storage", f"JARVIS load failed: {e}")
-            
-    JARVIS_STATE_CACHE = {"jobs": [], "alerts": [], "confirmations": {}}
-    return JARVIS_STATE_CACHE
-
-def save_jarvis_state(data: dict):
-    global JARVIS_STATE_CACHE
-    JARVIS_STATE_CACHE = data
-    try:
-        folder = os.path.dirname(JARVIS_FILE)
-        if folder: os.makedirs(folder, exist_ok=True)
-        temp_file = f"{JARVIS_FILE}.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(temp_file, JARVIS_FILE)
-    except Exception as e:
-        jarvis_log("ERROR", "Storage", f"JARVIS atomic save failed: {e}")
-
-# Existing Analytics State Handlers
-def load_analytics():
-    global MEMORY_CACHE
-    if MEMORY_CACHE: return MEMORY_CACHE
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                MEMORY_CACHE = json.load(f)
-                return MEMORY_CACHE
-        except Exception as e:
-            jarvis_log("ERROR", "Storage", f"Analytics load failed: {e}")
-    MEMORY_CACHE = {}
-    return MEMORY_CACHE
-
-def save_analytics(data):
-    global MEMORY_CACHE
-    MEMORY_CACHE = data
-    try:
-        folder = os.path.dirname(DB_FILE)
-        if folder: os.makedirs(folder, exist_ok=True)
-        temp_file = f"{DB_FILE}.tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(temp_file, DB_FILE)
-    except Exception as e:
-        jarvis_log("ERROR", "Storage", f"Analytics save failed: {e}")
-
-def save_queue_state(queue_list):
-    db = load_analytics()
-    db["saved_queue_state"] = list(queue_list)
-    save_analytics(db)
-
-def get_saved_queue_state():
-    db = load_analytics()
-    value = db.get("saved_queue_state", [])
-    return value if isinstance(value, list) else []
-
-def update_joins_score(channel_id, channel_title, joins_gained):
-    db = load_analytics()
-    ch_key = str(channel_id)
-    now = get_local_now()
-    if ch_key not in db or not isinstance(db.get(ch_key), dict):
-        db[ch_key] = {"title": channel_title, "total_joins": 0, "runs": 0, "time_history": []}
-    entry = db[ch_key]
-    joins_gained = max(0, int(joins_gained))
-    entry["runs"] += 1
-    entry["total_joins"] += joins_gained
-    entry["time_history"].append({
-        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "hour": now.strftime("%I:%M %p"),
-        "joins": joins_gained,
-    })
-    entry["time_history"] = entry["time_history"][-200:]
-    save_analytics(db)
-
-# ========================================================
-# AUTHORIZATION
-# ========================================================
-def init_authorization():
-    global ADMIN_IDS
-    if AUTHORIZED_ADMINS_STR:
-        try:
-            ADMIN_IDS = {int(x.strip()) for x in AUTHORIZED_ADMINS_STR.split(",") if x.strip()}
-        except Exception:
-            jarvis_log("WARNING", "Auth", "Failed to parse AUTHORIZED_ADMINS.")
-
-def is_authorized(sender_id: int) -> bool:
-    if not ADMIN_IDS: 
-        return True # If no strict list, allow ME
-    return sender_id in ADMIN_IDS or sender_id == ME_ID
-
-# ========================================================
-# TELEGRAM CLIENT INITIALIZATION
-# ========================================================
-if SESSION_STRING:
-    client = TelegramClient(StringSession(SESSION_STRING.strip()), API_ID, API_HASH)
-else:
-    client = TelegramClient("devil_main_session_acc2", API_ID, API_HASH)
-
-async def safe_api_call(coro_func, *args, retries=3, **kwargs):
-    attempt = 0
-    while attempt < retries:
-        try:
-            return await coro_func(*args, **kwargs)
-        except errors.FloodWaitError as e:
-            attempt += 1
-            wait_time = max(0, int(e.seconds))
-            jarvis_log("WARNING", "TelegramAPI", f"FloodWait {wait_time}s (attempt {attempt}/{retries})")
-            await asyncio.sleep(wait_time)
-            if attempt >= retries: return None
-        except (errors.ChatAdminRequiredError, errors.ChannelPrivateError, 
-                errors.ChatWriteForbiddenError, errors.UserBannedInChannelError):
-            return "PERMISSION_ERROR"
-        except Exception as e:
-            jarvis_log("ERROR", "TelegramAPI", f"Exception: {e}")
-            return None
-    return None
-
-# ========================================================
-# GEMINI CLIENT
-# ========================================================
-def get_system_snapshot():
-    db = load_analytics()
-    return {
-        "engine_running": CROSS_LOOP_RUNNING,
-        "queue_length": len(CHANNELS_QUEUE),
-        "source_messages_configured": bool(CURRENT_SOURCE_MSGS),
-        "tracker": status_tracker,
-        "time": get_local_now().isoformat()
-    }
-
-# ========================================================
-# JARVIS INTENT PARSER
-# ========================================================
-JARVIS_SYSTEM_PROMPT = """
-You are JARVIS, the core intelligence managing a Telegram automation system.
-Your job is to parse the user's natural language input (which may be in English, Hindi, Hinglish, or Nepali) 
-and return a STRICT JSON output indicating the intent.
-
-Available Intents:
-- START_CROSS: Start the cross-promo engine. Can optionally include a `duration` (in seconds).
-- STOP_CROSS: Stop the cross-promo engine.
-- RESET_QUEUE: Reset the engine's queue state.
-- GET_STATUS: Get the current statistics and state of the system.
-- GET_DIAGNOSTICS: Check system health and errors.
-- GENERIC_CHAT: Use this if the user is just saying hello or asking a general question not related to commands.
-
-Rules for delays:
-If the user specifies they want an action done in the future (e.g., "start cross after 2 hours", "me sona ja rha hu 2 ghante baad cross start kr dena"), 
-you MUST extract that time and calculate `delay_seconds`.
-
-JSON RESPONSE FORMAT:
-{
-    "intent": "INTENT_NAME",
-    "params": {"duration": 3600}, // Optional parameters for the command
-    "delay_seconds": 7200, // 0 if immediate, >0 if scheduled for later
-    "requires_confirmation": false, // true if action is highly destructive (like full database wipe)
-    "ai_reply": "Got it, I will start the engine in 2 hours." // A natural language acknowledgement
-}
-Return ONLY valid JSON. No markdown wrappers. No explanations outside JSON.
-"""
-
-async def parse_intent_with_gemini(user_text: str) -> dict:
-    if not GEMINI_API_KEY or not genai:
-        raise Exception("Gemini API not configured or package missing.")
-        
-    ai_client = genai.Client(api_key=GEMINI_API_KEY)
-    prompt = f"{JARVIS_SYSTEM_PROMPT}\n\nSystem State:\n{json.dumps(get_system_snapshot())}\n\nUser Input: {user_text}"
-    
-    response = await asyncio.to_thread(
-        ai_client.models.generate_content,
-        model=GEMINI_MODEL,
-        contents=prompt,
-    )
-    
-    text = (getattr(response, "text", "") or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
-    
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        jarvis_log("ERROR", "Parser", f"Failed to parse Gemini output: {text}")
-        raise Exception("AI returned invalid intent structure.")
-
-# ========================================================
-# RULE ENGINE & PREFLIGHT
-# ========================================================
-def run_preflight_checks(intent: str, params: dict) -> tuple[bool, str]:
-    if intent == "START_CROSS":
-        if CROSS_LOOP_RUNNING:
-            return False, "Engine is already running."
-        if not CURRENT_SOURCE_MSGS and not get_saved_queue_state():
-            return False, "No source messages configured and no saved queue. User must reply to a message with /cross start first."
-    elif intent == "STOP_CROSS":
-        if not CROSS_LOOP_RUNNING:
-            return False, "Engine is already stopped."
-    return True, "Preflight OK"
-
-# ========================================================
-# SAFE TOOL REGISTRY
-# ========================================================
-async def execute_tool(intent: str, params: dict) -> str:
-    jarvis_log("INFO", "ToolRegistry", f"Executing Tool: {intent} | Params: {params}")
-    
-    if intent == "START_CROSS":
-        duration = params.get("duration", None)
-        return await start_engine_logic(duration)
-        
-    elif intent == "STOP_CROSS":
-        await stop_cross_task(save=True)
-        return "🛑 Engine stopped gracefully."
-        
-    elif intent == "RESET_QUEUE":
-        return await reset_engine_logic()
-        
-    elif intent == "GET_STATUS":
-        return generate_status_report()
-        
-    elif intent == "GET_DIAGNOSTICS":
-        health = run_diagnostics()
-        return f"🔧 **Diagnostics Report**\n```json\n{json.dumps(health, indent=2)}\n```"
-        
-    elif intent == "GENERIC_CHAT":
-        return params.get("ai_reply", "I am JARVIS. Awaiting instructions.")
-        
-    return f"Unknown intent execution: {intent}"
-
-# ========================================================
-# CONFIRMATION SYSTEM
-# ========================================================
-async def request_confirmation(event, intent: str, params: dict, delay: int):
-    state = load_jarvis_state()
-    conf_id = str(uuid.uuid4())[:8]
-    state["confirmations"][conf_id] = {
-        "intent": intent,
-        "params": params,
-        "delay": delay,
-        "expires": time.time() + 300 # 5 minutes
-    }
-    save_jarvis_state(state)
-    await event.reply(f"⚠️ Action '{intent}' requires confirmation. Reply with `CONFIRM {conf_id}` to proceed.")
-
-# ========================================================
-# SCHEDULER & PERSISTENT JOBS
-# ========================================================
-def schedule_job(intent: str, params: dict, delay_seconds: int) -> ScheduledJob:
-    state = load_jarvis_state()
-    execute_at = time.time() + delay_seconds
-    
-    # Deduplication check
-    for existing in state["jobs"]:
-        if existing["intent"] == intent and existing["status"] == "pending":
-            if abs(existing["scheduled_time"] - execute_at) < 60:
-                jarvis_log("INFO", "Scheduler", "Skipped duplicate job.")
-                return ScheduledJob(**existing)
-
-    job = ScheduledJob(
-        job_id=str(uuid.uuid4())[:8],
-        intent=intent,
-        params=params,
-        scheduled_time=execute_at,
-        status="pending",
-        created_at=time.time()
-    )
-    state["jobs"].append(asdict(job))
-    save_jarvis_state(state)
-    jarvis_log("INFO", "Scheduler", f"Job scheduled: {job.job_id} for {intent} in {delay_seconds}s")
-    return job
-
-async def jarvis_scheduler_loop():
-    jarvis_log("INFO", "Scheduler", "Background scheduler started.")
-    while True:
-        try:
-            state = load_jarvis_state()
-            now = time.time()
-            modified = False
-            
-            for job_data in state["jobs"]:
-                if job_data["status"] == "pending" and job_data["scheduled_time"] <= now:
-                    job_id = job_data["job_id"]
-                    intent = job_data["intent"]
-                    params = job_data["params"]
-                    
-                    jarvis_log("INFO", "Scheduler", f"Executing scheduled job: {job_id}")
-                    
-                    # Run preflight rules again before execution
-                    passed, msg = run_preflight_checks(intent, params)
-                    if passed:
-                        result = await execute_tool(intent, params)
-                        job_data["status"] = "completed"
-                        await send_alert_to_admin(f"✅ **Scheduled Task Completed:** {intent}\nResult: {result}")
-                    else:
-                        job_data["status"] = "failed"
-                        job_data["error"] = msg
-                        await send_alert_to_admin(f"❌ **Scheduled Task Failed Preflight:** {intent}\nReason: {msg}")
-                        
-                    modified = True
-            
-            # Clean up old confirmations
-            to_delete = [k for k, v in state.get("confirmations", {}).items() if v["expires"] < now]
-            for k in to_delete:
-                del state["confirmations"][k]
-                modified = True
-
-            if modified:
-                save_jarvis_state(state)
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            jarvis_log("ERROR", "Scheduler", f"Loop exception: {e}")
-            
-        await asyncio.sleep(10)
-
-# ========================================================
-# ALERT & RECOVERY SYSTEM
-# ========================================================
-def register_alert(level: str, message: str):
-    state = load_jarvis_state()
-    alert = SystemAlert(str(uuid.uuid4())[:8], level, message, time.time())
-    state["alerts"].append(asdict(alert))
-    state["alerts"] = state["alerts"][-50:] # Keep last 50
-    save_jarvis_state(state)
-
-async def send_alert_to_admin(message: str):
-    if ME_ID:
-        try:
-            await client.send_message(ME_ID, message)
-        except Exception as e:
-            jarvis_log("ERROR", "AlertSystem", f"Failed to send admin alert: {e}")
-
-# ========================================================
-# APPLICATION / CROSS CONTROL (Existing Logic Wrapped)
-# ========================================================
-async def start_engine_logic(duration_sec=None) -> str:
-    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, LOOP_END_TIME
-    
-    if duration_sec:
-        LOOP_END_TIME = get_local_now() + timedelta(seconds=int(duration_sec))
-        status_tracker["timer_end"] = LOOP_END_TIME.strftime("%I:%M %p (%d-%b)")
-        timer_msg = f"Active for {duration_sec}s"
+async def ai_execute(plan: dict[str, Any], owner_id: int) -> str:
+    global AI_LAST_RESULT
+    action = str(plan.get("action", "REPORT")).upper()
+    if action not in ALLOWED_ACTIONS:
+        action = "REPORT"
+
+    if action == "STATUS":
+        result = format_status_text()
+    elif action == "DIAGNOSTICS":
+        result = await run_diagnostics()
+    elif action == "START_CROSS":
+        ok, message = await start_engine(plan.get("duration_seconds") or None)
+        result = message
+        if not ok:
+            result = f"❌ {result}"
+    elif action == "STOP_CROSS":
+        _, result = await stop_engine(save=True)
+    elif action == "RESET_CROSS":
+        _, result = await reset_engine()
+    elif action == "SAVE_STATE":
+        await save_runtime_state()
+        result = "State saved successfully."
+    elif action == "SCHEDULE_START":
+        job = await schedule_job(
+            "START_CROSS",
+            {"duration_seconds": safe_int(plan.get("duration_seconds"), 0)},
+            safe_int(plan.get("delay_seconds"), 0),
+            owner_id,
+        )
+        result = f"Scheduled START_CROSS as `{job.job_id}` for {job.execute_at}."
+    elif action == "SCHEDULE_STOP":
+        job = await schedule_job(
+            "STOP_CROSS",
+            {},
+            safe_int(plan.get("delay_seconds"), 0),
+            owner_id,
+        )
+        result = f"Scheduled STOP_CROSS as `{job.job_id}` for {job.execute_at}."
+    elif action == "ASK_CONFIRMATION":
+        confirmation_id = uuid.uuid4().hex[:10]
+        state = load_state_sync()
+        state["confirmations"][confirmation_id] = {
+            "owner_id": owner_id,
+            "plan": plan,
+            "created_at": iso(now_utc()),
+            "expires_at": iso(now_utc() + timedelta(minutes=10)),
+        }
+        save_state_sync(state)
+        result = f"Confirmation required. Use `/ai confirm {confirmation_id}` within 10 minutes."
     else:
-        LOOP_END_TIME = None
-        status_tracker["timer_end"] = "24/7 Unlimited Mode"
-        timer_msg = "Continuous Mode"
+        result = plan.get("message") or plan.get("reason") or "No action needed."
 
-    saved_q = get_saved_queue_state()
-    if saved_q:
-        CHANNELS_QUEUE = saved_q
-        msg = f"🔄 Resumed saved queue. Size: {len(CHANNELS_QUEUE)} | {timer_msg}"
-    else:
-        channels = await get_folder_channels_safely(FOLDER_TARGET_NAME)
-        if not channels:
-            return f"❌ Folder '{FOLDER_TARGET_NAME}' is empty!"
-        CHANNELS_QUEUE = list(channels)
-        msg = f"🚀 Devil Engine V7.0 Active. Targets: {len(CHANNELS_QUEUE)} | {timer_msg}"
+    AI_LAST_RESULT = str(result)
+    return str(result)
 
-    CROSS_LOOP_RUNNING = True
-    status_tracker.update({
-        "total": len(CHANNELS_QUEUE),
-        "completed": 0,
-        "skipped": 0,
-        "remaining": len(CHANNELS_QUEUE),
-        "current_channel": "None",
-    })
-    
-    start_cross_task(CURRENT_SOURCE_MSGS)
-    return msg
 
-async def reset_engine_logic() -> str:
-    global CHANNELS_QUEUE, PERMANENT_BAD_CHANNELS, LOOP_END_TIME
-    await stop_cross_task(save=False)
-    CHANNELS_QUEUE = []
-    PERMANENT_BAD_CHANNELS.clear()
-    LOOP_END_TIME = None
-    save_queue_state([])
-    status_tracker.update({
-        "total": 0, "completed": 0, "skipped": 0,
-        "remaining": 0, "current_channel": "None", "timer_end": "None",
-    })
-    return "🔄 Queue & Bad channel list reset completed!"
+async def ai_process_instruction(instruction: str, owner_id: int) -> str:
+    global AI_BUSY, AI_LAST_DECISION
+    async with ai_lock:
+        if AI_BUSY:
+            return "🧠 JARVIS is already processing another request."
+        AI_BUSY = True
 
-# ========================================================
-# STATUS FUNCTIONS
-# ========================================================
-def generate_status_report() -> str:
-    db = load_analytics()
-    sorted_channels = [item for item in db.items() if item[0] != "saved_queue_state" and isinstance(item[1], dict)]
-    sorted_channels.sort(key=lambda x: x[1].get("total_joins", 0), reverse=True)
+    try:
+        plan = await deterministic_ai_plan(instruction)
+        if plan is None:
+            plan = await ask_gemini(instruction)
+        AI_LAST_DECISION = plan
+        result = await ai_execute(plan, owner_id)
+        return (
+            f"🧠 **JARVIS**\n"
+            f"• Action: `{plan.get('action')}`\n"
+            f"• Reason: {plan.get('reason', 'N/A')}\n\n"
+            f"🤖 **Result**\n{result}"
+        )
+    finally:
+        async with ai_lock:
+            AI_BUSY = False
 
-    hot_list, cold_list = [], []
-    for key, value in sorted_channels:
-        history = value.get("time_history", [])
-        time_log = ""
-        if history:
-            best_run = max(history, key=lambda x: x.get("joins", 0))
-            if best_run.get("joins", 0) > 0:
-                time_log = f" (Peak: +{best_run['joins']} at {best_run.get('hour', '?')})"
-        
-        display_text = f"• {value.get('title', 'Unknown')} +{value.get('total_joins', 0)} joins{time_log}"
-        if value.get("total_joins", 0) > 2: hot_list.append(display_text)
-        else: cold_list.append(display_text)
 
-    hot_display = "\n".join(hot_list[:10]) if hot_list else "None"
-    
-    status_text = (
-        "📊 **JARVIS ENGINE STATUS**\n\n"
-        f"• Status: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
-        f"• Timer: {status_tracker.get('timer_end', 'None')}\n"
-        f"• Processed: {status_tracker['completed']} | Skipped: {status_tracker['skipped']}\n"
-        f"• Remaining Queue: {len(CHANNELS_QUEUE)}\n"
-        f"• Current Target: {status_tracker['current_channel']}\n\n"
-        f"🔥 **TOP HOT CHANNELS**\n{hot_display}"
+# ============================================================
+# STATUS / DIAGNOSTICS
+# ============================================================
+
+
+def format_status_text() -> str:
+    uptime = "N/A"
+    if STARTED_AT:
+        elapsed = max(0, int((now_utc() - STARTED_AT).total_seconds()))
+        uptime = str(timedelta(seconds=elapsed))
+
+    jobs = load_jobs_sync()
+    pending_jobs = sum(1 for j in jobs if j.get("status") == "pending")
+    return (
+        "📊 **JARVIS STATUS**\n\n"
+        f"• Engine: **{'RUNNING' if CROSS_LOOP_RUNNING else 'IDLE'}**\n"
+        f"• Queue: **{len(CHANNELS_QUEUE)}**\n"
+        f"• Deferred: **{len(DEFERRED_QUEUE)}**\n"
+        f"• Failed/blocked: **{len(PERMANENT_BAD_CHANNELS)}**\n"
+        f"• Processed: **{status_tracker['completed']}**\n"
+        f"• Skipped: **{status_tracker['skipped']}**\n"
+        f"• Current: **{status_tracker['current_channel']}**\n"
+        f"• Timer: **{format_timer()}**\n"
+        f"• Scheduled pending: **{pending_jobs}**\n"
+        f"• Uptime: **{uptime}**\n"
+        f"• Last error: **{LAST_ERROR or 'None'}**"
     )
-    return status_text
 
-# ========================================================
-# EXISTING CORE LOGIC HELPER METHODS
-# ========================================================
-def parse_duration(text_args):
-    if not text_args: return None
-    match = re.search(r"(\d+)\s*(hours?|hrs?|h|minutes?|mins?|min|m|days?|d)?", text_args, re.IGNORECASE)
-    if not match: return None
-    val, unit = int(match.group(1)), (match.group(2) or "h").lower()
-    if unit.startswith("h"): return val * 3600
-    if unit.startswith("m"): return val * 60
-    if unit.startswith("d"): return val * 86400
-    return val * 3600
 
-def clean_and_repair_url(url):
-    if not url: return ""
-    url = str(url).strip()
-    if url.startswith("ps://"): url = "htt" + url
-    elif url.startswith("tps://"): url = "ht" + url
-    elif url.startswith("s://"): url = "http" + url
-    match = re.search(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(.*)", url, re.IGNORECASE)
-    if match: return f"https://t.me/{match.group(1)}"
-    if url.startswith("@"): return f"https://t.me/{url[1:]}"
-    return url
+async def run_diagnostics() -> str:
+    checks: list[tuple[str, bool, str]] = []
 
-def extract_link_token(link):
-    if not link: return ""
-    clean_link = clean_and_repair_url(link).rstrip("/")
-    match = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/|addlist/)?([\w\-]+)", clean_link, re.IGNORECASE)
-    if match: return match.group(1).lower()
-    if clean_link.startswith("@"): return clean_link[1:].lower()
-    return clean_link.lower()
+    checks.append(("Telegram connection", client.is_connected(), "connected" if client.is_connected() else "disconnected"))
+    checks.append(("Gemini SDK", genai is not None and genai_types is not None, "installed" if genai else "missing"))
+    checks.append(("Gemini key", bool(GEMINI_API_KEY), "configured" if GEMINI_API_KEY else "missing"))
+    checks.append(("Source", bool(CURRENT_SOURCE_MSGS), "configured" if CURRENT_SOURCE_MSGS else "missing"))
+    checks.append(("State file", STATE_FILE.parent.exists(), str(STATE_FILE)))
+    checks.append(("Engine task", bool(RUN_TASK and not RUN_TASK.done()), "running" if RUN_TASK and not RUN_TASK.done() else "idle"))
+    checks.append(("Scheduler task", bool(SCHEDULER_TASK and not SCHEDULER_TASK.done()), "running" if SCHEDULER_TASK and not SCHEDULER_TASK.done() else "idle"))
 
-def get_all_links_from_msg(msg):
-    links = []
-    if not msg: return links
-    if getattr(msg, "reply_markup", None):
+    if genai is not None and genai_types is not None and GEMINI_API_KEY and AIPlan is not None:
         try:
-            for row in getattr(msg.reply_markup, "rows", []):
-                for button in getattr(row, "buttons", []):
-                    url = getattr(button, "url", None)
-                    if url: links.append(clean_and_repair_url(url))
-        except Exception: pass
-    raw_text = getattr(msg, "raw_text", "") or getattr(msg, "message", "") or ""
-    if getattr(msg, "entities", None):
-        for entity in msg.entities:
-            if isinstance(entity, MessageEntityTextUrl):
-                url = getattr(entity, "url", None)
-                if url: links.append(clean_and_repair_url(url))
-            elif isinstance(entity, MessageEntityUrl):
-                try:
-                    offset, length = entity.offset, entity.length
-                    value = raw_text[offset:offset + length]
-                    if value: links.append(clean_and_repair_url(value))
-                except Exception: pass
-    if raw_text:
-        tg_pattern = r"(?:https?://|ps://|tps://|s://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:\+[\w\-]+|joinchat/[\w\-]+|addlist/[\w\-]+|[\w\-]+)"
-        for match in re.findall(tg_pattern, raw_text, re.IGNORECASE): links.append(clean_and_repair_url(match))
-        for mention in re.findall(r"(?<!\w)@([\w\-]+)", raw_text): links.append(f"https://t.me/{mention}")
-    seen, unique = set(), []
-    for link in links:
-        link = clean_and_repair_url(link)
-        low = link.lower()
-        if "t.me/" in low or "telegram.me/" in low or low.startswith("@"):
-            token = extract_link_token(link)
-            if token and token not in seen:
-                seen.add(token)
-                unique.append(link)
-    return unique
+            ai_client = genai.Client(api_key=GEMINI_API_KEY)
+            response = await asyncio.to_thread(
+                ai_client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents="Return a JSON object with action STATUS, reason 'diagnostic', message 'ok', delay_seconds 0, duration_seconds 0.",
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=AIPlan,
+                ),
+            )
+            AIPlan.model_validate_json(getattr(response, "text", ""))
+            checks.append(("Gemini API", True, f"{GEMINI_MODEL} responded"))
+        except Exception as exc:
+            checks.append(("Gemini API", False, str(exc)[:200]))
+    else:
+        checks.append(("Gemini API", False, "not configured"))
 
-def check_duplicate_link_in_msg(msg, target_link):
-    target_token = extract_link_token(target_link)
-    if not target_token: return False
-    for link in get_all_links_from_msg(msg):
-        if target_token == extract_link_token(link): return True
-    return False
+    lines = ["🩺 **JARVIS DIAGNOSTICS**"]
+    for name, ok, detail in checks:
+        lines.append(f"{'✅' if ok else '❌'} {name}: {detail}")
+    lines.append(f"Queue={len(CHANNELS_QUEUE)}, Deferred={len(DEFERRED_QUEUE)}, Failed={len(PERMANENT_BAD_CHANNELS)}")
+    return "\n".join(lines)
 
-async def safe_resolve_entity_id(link):
-    token = extract_link_token(link)
-    if not token: return "UNKNOWN"
-    if token in LINK_RESOLVE_CACHE: return LINK_RESOLVE_CACHE[token]
-    resolved_id = "UNKNOWN"
-    try:
-        invite_match = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w\-]+)", link, re.IGNORECASE)
-        if invite_match:
-            res = await safe_api_call(client, CheckChatInviteRequest, invite_match.group(1))
-            if isinstance(res, (ChatInviteAlready, ChatInvite)):
-                chat = getattr(res, "chat", None)
-                if chat: resolved_id = getattr(chat, "id", "UNKNOWN")
-        elif "addlist/" in link.lower(): resolved_id = "UNKNOWN"
-        else:
-            resolved = await safe_api_call(client.get_entity, link)
-            if resolved and resolved != "PERMISSION_ERROR": resolved_id = getattr(resolved, "id", "UNKNOWN")
-    except Exception: resolved_id = "UNKNOWN"
-    if isinstance(resolved_id, int): resolved_id = abs(resolved_id)
-    LINK_RESOLVE_CACHE[token] = resolved_id
-    return resolved_id
 
-async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
-    current_channel_id = abs(current_channel_entity.id)
-    blacklist_words = ["no link", "no cross", "admin remove", "cross off", "no promo", "link not allowed"]
-    for msg in messages_list:
-        raw_text = getattr(msg, "raw_text", "") or getattr(msg, "message", "") or ""
-        if raw_text and any(word in raw_text.lower() for word in blacklist_words):
-            return False, None
-    candidate_links = []
-    for msg in messages_list: candidate_links.extend(get_all_links_from_msg(msg))
-    seen, unique_candidates = set(), []
-    for link in candidate_links:
-        token = extract_link_token(link)
-        if token and token not in seen:
-            seen.add(token)
-            unique_candidates.append(clean_and_repair_url(link))
-    own_links = []
-    for raw_link in unique_candidates:
-        resolved_id = await safe_resolve_entity_id(raw_link)
-        if resolved_id == "UNKNOWN": return False, None
-        if resolved_id == current_channel_id: own_links.append(raw_link)
-        else: return False, None
-    if own_links: return True, own_links[0]
-    if bio_text:
-        dummy_msg = type("DummyMsg", (), {"raw_text": bio_text, "message": bio_text, "reply_markup": None, "entities": None})()
-        for link in get_all_links_from_msg(dummy_msg):
-            resolved_id = await safe_resolve_entity_id(link)
-            if resolved_id == current_channel_id: return True, clean_and_repair_url(link)
-            if resolved_id != "UNKNOWN": return False, None
-    username = getattr(current_channel_entity, "username", "")
-    if username: return True, f"https://t.me/{username}"
-    return True, "SKIP_DROP"
+# ============================================================
+# WEB AUTH
+# ============================================================
 
-async def get_current_join_requests(target_channel):
-    try:
-        full_channel = await safe_api_call(client, GetFullChannelRequest, target_channel)
-        if full_channel and full_channel != "PERMISSION_ERROR":
-            pending = getattr(full_channel.full_chat, "requests_pending", None)
-            return 0 if pending is None else pending
-    except Exception as e: jarvis_log("ERROR", "API", f"Join request check failed: {e}")
-    return None
 
-async def get_folder_channels_safely(target_name):
-    channel_ids = []
-    try:
-        result = await safe_api_call(client, GetDialogFiltersRequest())
-        if not result or result == "PERMISSION_ERROR": return []
-        target_clean = str(target_name).strip().lower()
-        filters_list = getattr(result, "filters", result)
-        for dialog_filter in filters_list:
-            if not isinstance(dialog_filter, DialogFilter): continue
-            title_obj = getattr(dialog_filter, "title", None)
-            folder_title = str(getattr(title_obj, "text", title_obj) or "").strip()
-            if folder_title.lower() != target_clean: continue
-            for peer in getattr(dialog_filter, "include_peers", []):
-                raw_id = getattr(peer, "channel_id", None)
-                if raw_id: channel_ids.append(int(raw_id))
-    except Exception as e: jarvis_log("ERROR", "API", f"Folder scan failed: {e}")
-    return list(dict.fromkeys(channel_ids))
+def web_authorized() -> bool:
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return False
+    token = header[7:].strip()
+    return bool(token) and token == JARVIS_WEB_TOKEN
 
-def start_cross_task(source_msgs):
-    global RUN_TASK
-    if RUN_TASK and not RUN_TASK.done(): return RUN_TASK
-    RUN_TASK = asyncio.create_task(run_cross_loop(source_msgs))
-    return RUN_TASK
 
-async def stop_cross_task(save=True):
-    global RUN_TASK, CROSS_LOOP_RUNNING, LOOP_END_TIME
-    CROSS_LOOP_RUNNING = False
-    LOOP_END_TIME = None
-    if save: save_queue_state(CHANNELS_QUEUE)
-    task = RUN_TASK
-    RUN_TASK = None
-    if task and not task.done():
-        task.cancel()
-        try: await task
-        except asyncio.CancelledError: pass
-
-# ========================================================
-# CORE CROSS LOOP 
-# ========================================================
-async def run_cross_loop(source_msgs):
-    global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, LOOP_END_TIME, PERMANENT_BAD_CHANNELS
-    status_tracker.update({"total": len(CHANNELS_QUEUE) + status_tracker["completed"], "remaining": len(CHANNELS_QUEUE)})
-    
-    while CROSS_LOOP_RUNNING:
-        try:
-            if LOOP_END_TIME and get_local_now() >= LOOP_END_TIME:
-                jarvis_log("INFO", "Engine", "Timer expired. Stopping cleanly.")
-                CROSS_LOOP_RUNNING = False
-                LOOP_END_TIME = None
-                save_queue_state(CHANNELS_QUEUE)
-                break
-
-            if not CHANNELS_QUEUE:
-                jarvis_log("INFO", "Engine", f"Reloading folder {FOLDER_TARGET_NAME}...")
-                channels = await get_folder_channels_safely(FOLDER_TARGET_NAME)
-                if channels:
-                    CHANNELS_QUEUE = [c for c in channels if c not in PERMANENT_BAD_CHANNELS]
-                    status_tracker["total"] += len(CHANNELS_QUEUE)
-                    save_queue_state(CHANNELS_QUEUE)
-                    await asyncio.sleep(15)
-                else:
-                    await asyncio.sleep(30)
-                    continue
-
-            if not CHANNELS_QUEUE: continue
-
-            channel_id = CHANNELS_QUEUE[0]
-            status_tracker["remaining"] = len(CHANNELS_QUEUE)
-
-            def finalize_current_channel():
-                if CHANNELS_QUEUE and CHANNELS_QUEUE[0] == channel_id:
-                    CHANNELS_QUEUE.pop(0)
-                    save_queue_state(CHANNELS_QUEUE)
-                    status_tracker["remaining"] = len(CHANNELS_QUEUE)
-
-            if channel_id in PERMANENT_BAD_CHANNELS:
-                finalize_current_channel()
-                continue
-
-            strict_id = int(f"-100{channel_id}" if not str(channel_id).startswith("-100") else channel_id)
-            if strict_id == int(TARGET_MAIN_CHANNEL):
-                finalize_current_channel()
-                continue
-
-            real_entity = await safe_api_call(client.get_entity, strict_id)
-            if real_entity in ("PERMISSION_ERROR", None):
-                PERMANENT_BAD_CHANNELS.add(channel_id)
-                status_tracker["skipped"] += 1
-                status_tracker["completed"] += 1
-                finalize_current_channel()
-                continue
-
-            ch_title = getattr(real_entity, "title", "Channel")
-            status_tracker["current_channel"] = ch_title
-
-            messages_to_scan = []
-            try:
-                async for last_msg in client.iter_messages(real_entity, limit=4):
-                    messages_to_scan.append(last_msg)
-                pinned_msgs = await safe_api_call(client.get_messages, real_entity, filter=InputMessagesFilterPinned(), limit=1)
-                if pinned_msgs and isinstance(pinned_msgs, list):
-                    messages_to_scan.extend(pinned_msgs)
-            except Exception: pass
-
-            bio = ""
-            try:
-                full_channel = await safe_api_call(client, GetFullChannelRequest, real_entity)
-                if full_channel and full_channel != "PERMISSION_ERROR":
-                    bio = getattr(full_channel.full_chat, "about", "") or ""
-            except Exception: pass
-
-            is_safe, target_link = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
-
-            if not is_safe or not target_link or target_link == "SKIP_DROP":
-                status_tracker["skipped"] += 1
-                finalize_current_channel()
-                continue
-
-            fwd_ids, first_fwd_id = [], None
-            if source_msgs:
-                fwd_msgs = await safe_api_call(client.forward_messages, real_entity, source_msgs[0], silent=False)
-                if fwd_msgs == "PERMISSION_ERROR":
-                    PERMANENT_BAD_CHANNELS.add(channel_id)
-                    status_tracker["skipped"] += 1
-                    finalize_current_channel()
-                    continue
-                if fwd_msgs:
-                    fwd = fwd_msgs[0] if isinstance(fwd_msgs, list) else fwd_msgs
-                    if getattr(fwd, "id", None):
-                        first_fwd_id = fwd.id
-                        fwd_ids.append(first_fwd_id)
-
-            if not first_fwd_id:
-                status_tracker["skipped"] += 1
-                finalize_current_channel()
-                continue
-
-            main_channel_msg_ids = []
-            before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            await asyncio.sleep(random.uniform(1.5, 3.5))
-
-            drop_text = target_link if target_link.startswith("http") else f"👉 {target_link}"
-            drop = await safe_api_call(client.send_message, TARGET_MAIN_CHANNEL, drop_text, silent=True)
-            if drop and getattr(drop, "id", None): main_channel_msg_ids.append(drop.id)
-
-            stop_secondary_flag = asyncio.Event()
-
-            async def send_secondary_posts_task():
-                if len(source_msgs) <= 1: return
-                try:
-                    for msg in source_msgs[1:]:
-                        post_delay = random.randint(45, 120)
-                        elapsed = 0
-                        while elapsed < post_delay:
-                            if stop_secondary_flag.is_set() or not CROSS_LOOP_RUNNING: return
-                            await asyncio.sleep(2)
-                            elapsed += 2
-                        
-                        chk = await safe_api_call(client.get_messages, real_entity, ids=first_fwd_id)
-                        if not chk or getattr(chk, "empty", False):
-                            stop_secondary_flag.set()
-                            return
-
-                        if msg.media:
-                            sec_fwd = await safe_api_call(client.send_message, real_entity, msg.message or "", file=msg.media, reply_to=first_fwd_id, silent=False)
-                        else:
-                            sec_fwd = await safe_api_call(client.send_message, real_entity, msg.message or "", reply_to=first_fwd_id, silent=False)
-                        
-                        if sec_fwd and getattr(sec_fwd, "id", None): fwd_ids.append(sec_fwd.id)
-                except asyncio.CancelledError: raise
-                except Exception: pass
-
-            sec_task = asyncio.create_task(send_secondary_posts_task())
-            start_monitor_time = asyncio.get_event_loop().time()
-            total_wait_duration = 300
-
-            while (asyncio.get_event_loop().time() - start_monitor_time < total_wait_duration and CROSS_LOOP_RUNNING):
-                await asyncio.sleep(10)
-                chk_msg = await safe_api_call(client.get_messages, real_entity, ids=first_fwd_id)
-                if not chk_msg or getattr(chk_msg, "empty", False): break
-                
-                if target_link:
-                    recent_main = await safe_api_call(client.get_messages, TARGET_MAIN_CHANNEL, limit=8)
-                    if recent_main and isinstance(recent_main, list):
-                        for rm in recent_main:
-                            if rm.id not in main_channel_msg_ids and check_duplicate_link_in_msg(rm, target_link):
-                                main_channel_msg_ids.append(rm.id)
-
-            stop_secondary_flag.set()
-            sec_task.cancel()
-            try: await sec_task
-            except asyncio.CancelledError: pass
-
-            after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
-            if before_joins is not None and after_joins is not None:
-                joins_gained = max(0, after_joins - before_joins)
-                update_joins_score(channel_id, ch_title, joins_gained)
-
-            if main_channel_msg_ids:
-                await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, main_channel_msg_ids)
-            if fwd_ids:
-                await safe_api_call(client.delete_messages, real_entity, fwd_ids)
-
-            status_tracker["completed"] += 1
-            finalize_current_channel()
-            await asyncio.sleep(random.randint(5, 10))
-
-        except asyncio.CancelledError:
-            save_queue_state(CHANNELS_QUEUE)
-            raise
-        except Exception as global_err:
-            jarvis_log("WARNING", "Engine", f"Recovered from exception -> {global_err}")
-            save_queue_state(CHANNELS_QUEUE)
-            await asyncio.sleep(5)
-            continue
-
-# ========================================================
-# TELEGRAM HANDLERS & /ai HANDLER
-# ========================================================
-@client.on(events.NewMessage())
-async def controller(event):
-    global CURRENT_SOURCE_MSGS, CHANNELS_QUEUE, CROSS_LOOP_RUNNING, LOOP_END_TIME
-
-    if not is_authorized(event.sender_id):
-        return
-
-    if not event.raw_text:
-        return
-
-    text = event.raw_text.strip()
-    lower_text = text.lower()
-
-    # CONFIRMATION HANDLER
-    if text.startswith("CONFIRM "):
-        conf_id = text.split(" ")[1]
-        state = load_jarvis_state()
-        if conf_id in state["confirmations"]:
-            conf_data = state["confirmations"][conf_id]
-            if conf_data["expires"] >= time.time():
-                del state["confirmations"][conf_id]
-                save_jarvis_state(state)
-                await event.reply("✅ Confirmation accepted. Executing...")
-                result = await execute_tool(conf_data["intent"], conf_data["params"])
-                await event.reply(result)
-            else:
-                await event.reply("❌ Confirmation expired.")
-        return
-
-    # FULL JARVIS AI HANDLER
-    if lower_text.startswith("/ai"):
-        instruction = text[3:].strip()
-        if not instruction:
-            await event.reply("🧠 **JARVIS Ready**\nAwaiting natural language commands. Example:\n`/ai me sona ja rha hu, 2 ghante baad cross start kr dena`")
-            return
-            
-        try:
-            status_msg = await event.reply("🧠 *JARVIS is thinking...*")
-            ai_data = await parse_intent_with_gemini(instruction)
-            
-            intent = ai_data.get("intent", "GENERIC_CHAT")
-            params = ai_data.get("params", {})
-            delay = int(ai_data.get("delay_seconds", 0))
-            requires_confirm = ai_data.get("requires_confirmation", False)
-            ai_reply = ai_data.get("ai_reply", "Processing...")
-
-            if requires_confirm:
-                await request_confirmation(event, intent, params, delay)
-                await status_msg.delete()
-                return
-
-            if delay > 0:
-                job = schedule_job(intent, params, delay)
-                response = f"✅ **JARVIS SCHEDULED TASK**\n{ai_reply}\n*(Job ID: `{job.job_id}` - Executes in {delay}s)*"
-            else:
-                passed, msg = run_preflight_checks(intent, params)
-                if not passed:
-                    response = f"⚠️ **JARVIS Preflight Failed:**\n{msg}"
-                else:
-                    tool_result = await execute_tool(intent, params)
-                    response = f"🤖 **JARVIS Execution Result:**\n{ai_reply}\n\n**System Output:**\n{tool_result}"
-
-            await status_msg.edit(response)
-
-        except Exception as e:
-            err_trace = traceback.format_exc()
-            jarvis_log("ERROR", "JARVIS", err_trace)
-            await event.reply(f"❌ **JARVIS Error:** {e}")
-        return
-
-    # EXISTING LEGACY HANDLERS (Mapped to same functions JARVIS uses)
-    if lower_text.startswith("/cross start"):
-        if not event.is_reply:
-            await event.reply("⚠️ Reply to a post to set promo messages!")
-            return
-        
-        duration_args = text[12:].strip()
-        duration_sec = parse_duration(duration_args)
-        
-        reply_msg = await event.get_reply_message()
-        source_msgs = [reply_msg]
-        try:
-            next_msgs = await safe_api_call(client.get_messages, event.chat_id, min_id=reply_msg.id, limit=2, reverse=True)
-            if next_msgs and isinstance(next_msgs, list):
-                for msg in next_msgs:
-                    if msg.raw_text and msg.raw_text.strip().lower().startswith("/"): continue
-                    source_msgs.append(msg)
-        except Exception: pass
-        
-        CURRENT_SOURCE_MSGS = source_msgs
-        
-        result = await start_engine_logic(duration_sec)
-        await event.reply(result)
-        return
-
-    if lower_text.startswith("/cross stop"):
-        await stop_cross_task(save=True)
-        await event.reply("🛑 Loop stopped & queue state saved.")
-        return
-
-    if lower_text.startswith("/cross reset"):
-        result = await reset_engine_logic()
-        await event.reply(result)
-        return
-
-    if lower_text.startswith("/status"):
-        await event.reply(generate_status_report())
-        return
-
-# ========================================================
-# QUART API
-# ========================================================
 @app.route("/")
 async def home():
     return jsonify({
         "status": "online",
-        "engine": "Devil Cross Engine V7.0 + JARVIS Brain",
-        "is_running": CROSS_LOOP_RUNNING,
+        "engine": APP_NAME,
+        "running": CROSS_LOOP_RUNNING,
         "ai_configured": bool(GEMINI_API_KEY),
     })
 
+
+@app.route("/health")
+async def health():
+    return jsonify({"status": "ok", "telegram_connected": client.is_connected()})
+
+
 @app.route("/api/status", methods=["GET"])
 async def api_status():
-    db = load_analytics()
-    analytics_data = [{"channel_id": k, "title": v.get("title"), "total_joins": v.get("total_joins")} 
-                      for k, v in db.items() if k != "saved_queue_state" and isinstance(v, dict)]
-    return jsonify({
-        "running": CROSS_LOOP_RUNNING,
-        "tracker": status_tracker,
-        "queue_length": len(CHANNELS_QUEUE),
-        "analytics": analytics_data,
-    })
+    if not web_authorized():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    return jsonify(get_ai_snapshot())
+
 
 @app.route("/api/start", methods=["POST"])
 async def api_start():
-    if CROSS_LOOP_RUNNING:
-        return jsonify({"status": "error", "message": "Engine is already running!"}), 400
-    if not CURRENT_SOURCE_MSGS:
-        return jsonify({"status": "error", "message": "No source message configured. Use /cross start first."}), 400
-        
-    data = await request.get_json() or {}
-    duration_str = data.get("duration", "")
-    seconds = parse_duration(duration_str)
-    
-    await start_engine_logic(seconds)
-    return jsonify({"status": "success", "message": "Cross loop started successfully!", "queue_count": len(CHANNELS_QUEUE)})
+    if not web_authorized():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    data = await request.get_json(silent=True) or {}
+    duration = parse_duration(str(data.get("duration", ""))) if data.get("duration") else safe_int(data.get("duration_seconds"), 0) or None
+    ok, message = await start_engine(duration)
+    return jsonify({"status": "success" if ok else "error", "message": message, "queue_count": len(CHANNELS_QUEUE)})
+
 
 @app.route("/api/stop", methods=["POST"])
 async def api_stop():
-    await stop_cross_task(save=True)
-    return jsonify({"status": "success", "message": "Loop stopped. Progress saved."})
+    if not web_authorized():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    _, message = await stop_engine(save=True)
+    return jsonify({"status": "success", "message": message})
 
-# ========================================================
-# BACKGROUND MONITOR, STARTUP & GRACEFUL SHUTDOWN
-# ========================================================
-async def run_quart():
-    """Runs Quart Server inside the async event loop"""
-    import hypercorn.asyncio
-    from hypercorn.config import Config
-    
-    config = Config()
-    config.bind = [f"0.0.0.0:{os.environ.get('PORT', '8080')}"]
-    jarvis_log("INFO", "System", "Starting Quart web server...")
-    await hypercorn.asyncio.serve(app, config)
 
-async def main():
-    global ME_ID, JARVIS_SCHEDULER_TASK
-    
-    init_authorization()
-    load_jarvis_state()
+@app.route("/api/reset", methods=["POST"])
+async def api_reset():
+    if not web_authorized():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    _, message = await reset_engine()
+    return jsonify({"status": "success", "message": message})
 
-    jarvis_log("INFO", "System", "Starting Telegram Client...")
+
+@app.route("/api/diagnostics", methods=["GET"])
+async def api_diagnostics():
+    if not web_authorized():
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    return jsonify({"status": "success", "report": await run_diagnostics()})
+
+
+# ============================================================
+# TELEGRAM CONTROLLER
+# ============================================================
+
+
+def telegram_authorized(sender_id: int | None) -> bool:
+    if not sender_id:
+        return False
+    if ME_ID is not None and sender_id == ME_ID:
+        return True
+    return sender_id in AUTHORIZED_ADMINS
+
+
+async def handle_confirmation(event: Any, confirmation_id: str) -> None:
+    state = load_state_sync()
+    item = state["confirmations"].get(confirmation_id)
+    if not item:
+        await event.reply("❌ Confirmation not found or expired.")
+        return
+
+    if safe_int(item.get("owner_id")) != safe_int(event.sender_id):
+        await event.reply("❌ This confirmation belongs to another authorized user.")
+        return
+
+    expires = parse_iso(item.get("expires_at"))
+    if not expires or expires < now_utc():
+        state["confirmations"].pop(confirmation_id, None)
+        save_state_sync(state)
+        await event.reply("⌛ Confirmation expired.")
+        return
+
+    state["confirmations"].pop(confirmation_id, None)
+    save_state_sync(state)
+    result = await ai_execute(item.get("plan", {}), safe_int(event.sender_id))
+    await event.reply(result[:4000])
+
+
+@client.on(events.NewMessage())
+async def controller(event: Any) -> None:
+    global ME_ID
+    try:
+        if ME_ID is None:
+            me = await client.get_me()
+            ME_ID = getattr(me, "id", None)
+        if not telegram_authorized(event.sender_id):
+            return
+        text = (event.raw_text or "").strip()
+        if not text:
+            return
+        lower = text.lower()
+
+        if lower.startswith("/ai confirm "):
+            await handle_confirmation(event, text.split(maxsplit=2)[2].strip())
+            return
+
+        if lower == "/ai" or lower.startswith("/ai "):
+            instruction = text[3:].strip()
+            if not instruction:
+                await event.reply(
+                    "🧠 **JARVIS ready**\n\n"
+                    "`/ai status`\n"
+                    "`/ai cross start`\n"
+                    "`/ai cross stop`\n"
+                    "`/ai cross reset`\n"
+                    "`/ai diagnostics`\n"
+                    "`/ai cross start after 1 hour`"
+                )
+                return
+            result = await ai_process_instruction(instruction, safe_int(event.sender_id))
+            await event.reply(result[:4000])
+            return
+
+        if lower.startswith("/cross start"):
+            if CROSS_LOOP_RUNNING:
+                await event.reply("⚠️ Engine is already running.")
+                return
+            ok, msg = await configure_source_from_event(event)
+            if not ok:
+                await event.reply(f"⚠️ {msg}")
+                return
+            duration_text = text[len("/cross start"):].strip()
+            duration = parse_duration(duration_text)
+            started, result = await start_engine(duration)
+            await event.reply(("✅ " if started else "❌ ") + result)
+            return
+
+        if lower.startswith("/cross stop"):
+            _, msg = await stop_engine(save=True)
+            await event.reply("🛑 " + msg)
+            return
+
+        if lower.startswith("/cross reset"):
+            _, msg = await reset_engine()
+            await event.reply("🔄 " + msg)
+            return
+
+        if lower.startswith("/status"):
+            await event.reply(format_status_text()[:4000])
+            return
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        global LAST_ERROR
+        LAST_ERROR = str(exc)[:500]
+        logger.error("[CONTROLLER] %s", exc, exc_info=True)
+        try:
+            await event.reply("❌ JARVIS controller error. Check diagnostics/logs.")
+        except Exception:
+            pass
+
+
+# ============================================================
+# QUART LIFECYCLE
+# ============================================================
+
+@app.before_serving
+async def startup() -> None:
+    global ME_ID, SCHEDULER_TASK
+
+    load_runtime_from_state()
+
     if not client.is_connected():
         await client.start()
 
     me = await client.get_me()
-    if me:
-        ME_ID = me.id
-        jarvis_log("INFO", "System", f"Authenticated as {me.first_name} (ID: {ME_ID})")
+    ME_ID = getattr(me, "id", None)
+    logger.info("[STARTUP] Telegram connected as %s", ME_ID)
 
-    # Start Jarvis Background Scheduler
-    JARVIS_SCHEDULER_TASK = asyncio.create_task(jarvis_scheduler_loop())
+    await recover_source_messages()
 
-    jarvis_log("INFO", "System", "✅ Devil Engine V7.0 + JARVIS Brain online.")
+    if SCHEDULER_TASK is None or SCHEDULER_TASK.done():
+        SCHEDULER_TASK = asyncio.create_task(scheduler_loop(), name="jarvis-scheduler")
 
-    # Run Telegram and Quart concurrently
-    quart_task = asyncio.create_task(run_quart())
-    
+    if CROSS_LOOP_RUNNING:
+        if CURRENT_SOURCE_MSGS:
+            global RUN_TASK
+            RUN_TASK = asyncio.create_task(run_cross_loop(), name="cross-engine")
+            logger.info("[STARTUP] Resumed persisted engine state")
+        else:
+            CROSS_LOOP_RUNNING = False
+            await save_runtime_state()
+            logger.warning("[STARTUP] Persisted engine was running but source messages were unavailable; engine left stopped")
+
+
+@app.after_serving
+async def shutdown() -> None:
+    global SCHEDULER_TASK
     try:
-        await client.run_until_disconnected()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        jarvis_log("INFO", "System", "Shutting down gracefully...")
-        if JARVIS_SCHEDULER_TASK: JARVIS_SCHEDULER_TASK.cancel()
-        quart_task.cancel()
-        await stop_cross_task(save=True)
+        await stop_engine(save=True)
+    except Exception:
+        logger.exception("[SHUTDOWN] Engine shutdown failed")
+
+    if SCHEDULER_TASK and not SCHEDULER_TASK.done():
+        SCHEDULER_TASK.cancel()
+        try:
+            await SCHEDULER_TASK
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("[SHUTDOWN] Scheduler shutdown failed")
+    SCHEDULER_TASK = None
+
+    try:
+        if client.is_connected():
+            await client.disconnect()
+    except Exception:
+        logger.exception("[SHUTDOWN] Telegram disconnect failed")
+
+
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Program interrupted by user.")
+    app.run(host="0.0.0.0", port=env_int("PORT", 8000))
