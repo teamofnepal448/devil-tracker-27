@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+From __future__ import annotations
 
 import asyncio
 import json
@@ -88,7 +87,7 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "devil_main_session")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 TARGET_MAIN_CHANNEL = env_int("TARGET_MAIN_CHANNEL", 1716302260)
 FOLDER_TARGET_NAME = os.getenv("FOLDER_TARGET_NAME", "RAN X CROXX").strip()
@@ -498,11 +497,11 @@ def clean_url(url: str) -> str:
         return ""
     value = str(url).strip()
     if value.startswith("ps://"):
-        value = "htt" + value
+        value = "https://" + value[5:]
     elif value.startswith("tps://"):
-        value = "ht" + value
+        value = "https://" + value[6:]
     elif value.startswith("s://"):
-        value = "http" + value
+        value = "https://" + value[4:]
 
     match = re.search(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(.*)", value, re.I)
     if match:
