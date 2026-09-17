@@ -31,10 +31,7 @@ API_ID = int(os.environ.get("API_ID", 36094172))
 API_HASH = os.environ.get("API_HASH", "ff6eee1bcccf82daea88c63c45b6b546")
 SESSION_STRING = os.environ.get("SESSION_STRING")
 
-GEMINI_API_KEY = os.environ.get(
-    "GEMINI_API_KEY", 
-    "AQ.Ab8RN6InYuWy8SqPS2qrcsu-r20aOM4SqWteebuFP8HtVMsM_A"
-)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", -1002413253133))
