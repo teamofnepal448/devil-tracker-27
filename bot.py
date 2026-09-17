@@ -34,7 +34,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
-TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", -1002413253133))
+TARGET_MAIN_CHANNEL = int(os.environ.get("TARGET_MAIN_CHANNEL", "1716302260"))
 FOLDER_TARGET_NAME = os.environ.get("FOLDER_TARGET_NAME", "RAN X CROXX")
 DB_FILE_NAME = os.environ.get("DB_FILE_NAME", "devil_analytics_acc2.json")
 
