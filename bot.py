@@ -16,9 +16,10 @@ from datetime import datetime, timedelta, timezone
 from quart import Quart, jsonify, request
 
 # ========================================================
-# 🚀 TIMEZONE CONFIGURATION (IST / NPT FIX)
+# 🚀 TIMEZONE CONFIGURATION (NPT / NEPAL TIME)
 # ========================================================
-LOCAL_TZ = timezone(timedelta(hours=5, minutes=30))
+# Nepal Time: UTC + 5:45
+LOCAL_TZ = timezone(timedelta(hours=5, minutes=45))
 
 def get_local_now():
     return datetime.now(LOCAL_TZ)
@@ -142,24 +143,17 @@ def load_custom_cross_msg():
     db = load_analytics()
     return db.get("custom_cross_msg", None)
 
+# 🆕 UPDATED: Only count joins (no time history)
 def update_joins_score(channel_id, channel_title, joins_gained):
     db = load_analytics()
     ch_key = str(channel_id)
-    now = get_local_now()
-    current_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    current_hour = now.strftime("%I:%M %p")
 
     if ch_key not in db:
-        db[ch_key] = {"title": channel_title, "total_joins": 0, "runs": 0, "time_history": []}
-
-    if "time_history" not in db[ch_key]:
-        db[ch_key]["time_history"] = []
+        db[ch_key] = {"title": channel_title, "total_joins": 0, "runs": 0}
 
     db[ch_key]["runs"] += 1
     db[ch_key]["total_joins"] += max(0, joins_gained)
-    db[ch_key]["time_history"].append({
-        "timestamp": current_time_str, "hour": current_hour, "joins": max(0, joins_gained)
-    })
+    # ✅ Time history REMOVED — sirf total count rakha
     save_analytics(db)
 
 # ========================================================
@@ -297,7 +291,6 @@ async def safe_resolve_entity_id(link):
 # ========================================================
 # 🚫 ADVANCED NO-LINK DETECTOR (TEXT + STICKER + EMOJI)
 # ========================================================
-# Multi-language / multi-format blacklist phrases
 BLACKLIST_PHRASES = [
     # English
     "no link", "no links", "no cross", "no promo", "no promotion",
@@ -314,27 +307,22 @@ BLACKLIST_PHRASES = [
     "link 🚫", "link ❌", "cross 🚫", "cross ❌",
 ]
 
-# Emoji-only markers indicating no-link (sticker meta text)
 BLACKLIST_EMOJI_TOKENS = ["🚫", "❌", "⛔", "🚷", "🛑", "⭕", "❎"]
 
-# Sticker emoji patterns (Telegram uses these in sticker alt text / emoji field)
 STICKER_NO_LINK_EMOJI_SETS = [
     {"🚫"}, {"❌"}, {"⛔"}, {"🚫", "🔗"}, {"🔗", "🚫"}, {"❌", "🔗"},
     {"🚫", "📢"}, {"⛔", "🔗"}, {"🛑"}, {"🚷"}
 ]
 
 def detect_no_link_from_text(text):
-    """Detect no-link signal from plain text (multi-language + emoji)"""
     if not text:
         return False
     lower = text.lower().strip()
     
-    # Direct phrase match
     for phrase in BLACKLIST_PHRASES:
         if phrase in lower:
             return True
     
-    # Emoji token match (if text is short and only has blacklist emoji)
     stripped = lower.replace(" ", "").replace("\n", "")
     for emo in BLACKLIST_EMOJI_TOKENS:
         if emo in stripped and len(stripped) <= 6:
@@ -343,25 +331,21 @@ def detect_no_link_from_text(text):
     return False
 
 def detect_no_link_from_sticker(msg):
-    """Detect no-link from sticker meta (emoji field + alt text)"""
     if not msg or not getattr(msg, 'sticker', None):
         return False
     
     sticker = msg.sticker
     
-    # Check sticker emoji field (backend meta)
     sticker_emoji = getattr(sticker, 'emoji', None) or ""
     if sticker_emoji:
         for emo_set in STICKER_NO_LINK_EMOJI_SETS:
             if all(e in sticker_emoji for e in emo_set):
                 return True
     
-    # Check sticker alt text (accessibility)
     alt_text = getattr(sticker, 'alt', None) or ""
     if alt_text and detect_no_link_from_text(alt_text):
         return True
     
-    # Check document attributes for text patterns
     try:
         attributes = getattr(getattr(sticker, 'attributes', None), '__iter__', None)
         if attributes:
@@ -374,29 +358,33 @@ def detect_no_link_from_sticker(msg):
     
     return False
 
+# ========================================================
+# 🔥 IMPROVED LINK VERIFICATION (STRICT OWN-LINK CHECK)
+# ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
     """Returns: (status, link_or_bio)
-    status = 'SAFE_LINK' → link mila
-    status = 'BIO_FALLBACK' → link nahi mila, but bio mein text hai → bio copy karo
-    status = 'SKIP' → blacklist match ya kuch bhi nahi mila
+    STRICT: Sirf usi channel ka apna link allow hoga. 
+    Agar kisi aur channel ka link mila → SKIP.
+    
+    status = 'SAFE_LINK' → apna link mila
+    status = 'BIO_FALLBACK' → link nahi mila, but bio text hai
+    status = 'SKIP' → blacklist / dusre ka link / kuch nahi mila
     """
     current_channel_id = abs(current_channel_entity.id)
+    current_username = (getattr(current_channel_entity, 'username', '') or '').lower().strip()
 
-    # 🚫 Advanced No-Link Detection: Text + Sticker + Emoji
+    # 🚫 Step 1: No-Link detection (text + sticker + emoji)
     for msg in messages_list:
         raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
         
-        # 1) Text-based detection
         if raw_text and detect_no_link_from_text(raw_text):
             print(f"🚫 No-link TEXT detected: '{raw_text[:50]}'")
             return 'SKIP', None
         
-        # 2) Sticker-based detection (emoji meta backend)
         if getattr(msg, 'sticker', None) and detect_no_link_from_sticker(msg):
             print(f"🚫 No-link STICKER detected (emoji meta)")
             return 'SKIP', None
         
-        # 3) Document/photo with emoji-only caption
         if raw_text and len(raw_text.strip()) <= 6:
             stripped = raw_text.strip()
             for emo in BLACKLIST_EMOJI_TOKENS:
@@ -404,6 +392,7 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
                     print(f"🚫 No-link EMOJI caption detected: '{stripped}'")
                     return 'SKIP', None
 
+    # 🔗 Step 2: Collect all candidate links
     candidate_links = []
     for msg in messages_list:
         candidate_links.extend(get_all_links_from_msg(msg))
@@ -416,28 +405,64 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
             seen_tokens.add(tok)
             unique_candidate_links.append(clean_and_repair_url(l))
 
-    own_extracted_links = []
+    # 🎯 Step 3: STRICT — check each link's resolved ID
+    own_link_found = None
+    foreign_link_found = False
+
     for raw_link in unique_candidate_links:
+        link_token = extract_link_token(raw_link)
+        
+        # Quick username match (fast path)
+        if current_username and link_token == current_username:
+            own_link_found = raw_link
+            break
+        
+        # Resolve and compare IDs
         resolved_id = await safe_resolve_entity_id(raw_link)
+        
+        if resolved_id == 'UNKNOWN':
+            # Can't resolve — skip this link, but don't fail yet
+            continue
+        
         if resolved_id == current_channel_id:
-            own_extracted_links.append(raw_link)
+            own_link_found = raw_link
+            break
+        else:
+            # 🚨 FOREIGN LINK DETECTED — yahi cross ghalat karta tha
+            print(f"🚨 Foreign link detected: {raw_link} (belongs to {resolved_id}, not {current_channel_id})")
+            foreign_link_found = True
+    
+    # ✅ Own link mila toh SAFE
+    if own_link_found:
+        return 'SAFE_LINK', own_link_found
+    
+    # 🚫 Foreign link mila but apna nahi → SKIP
+    if foreign_link_found:
+        print(f"🚫 Skipping {getattr(current_channel_entity, 'title', 'channel')}: only foreign links found")
+        return 'SKIP', None
 
-    if own_extracted_links:
-        return 'SAFE_LINK', own_extracted_links[0]
-
+    # 📝 Step 4: Bio fallback check
     if bio_text:
         dummy_msg = type('DummyMsg', (), {'raw_text': bio_text, 'message': bio_text, 'reply_markup': None, 'entities': None})()
         bio_links = get_all_links_from_msg(dummy_msg)
         for link in bio_links:
+            link_token = extract_link_token(link)
+            if current_username and link_token == current_username:
+                return 'SAFE_LINK', clean_and_repair_url(link)
+            
             resolved_id = await safe_resolve_entity_id(link)
             if resolved_id == current_channel_id:
                 return 'SAFE_LINK', clean_and_repair_url(link)
+            elif resolved_id != 'UNKNOWN':
+                # Bio me bhi foreign link → SKIP
+                print(f"🚫 Bio has foreign link only → SKIP")
+                return 'SKIP', None
 
-    current_username = getattr(current_channel_entity, 'username', '')
+    # 🎯 Step 5: Username fallback (agar channel ka username hai)
     if current_username:
         return 'SAFE_LINK', f"https://t.me/{current_username}"
 
-    # 🎯 Bio text hai toh copy karo
+    # 📝 Step 6: Bio text fallback
     if bio_text and len(bio_text.strip()) > 0:
         return 'BIO_FALLBACK', bio_text.strip()
 
@@ -495,7 +520,6 @@ def parse_duration(text_args):
 # ========================================================
 @app.before_serving
 async def startup_client():
-    """Ensure Telethon client starts automatically when hosted via ASGI/Quart."""
     global ME_ID, CUSTOM_CROSS_MSG
     if not client.is_connected():
         await client.start()
@@ -506,13 +530,13 @@ async def startup_client():
     except Exception as e:
         print(f"⚠️ Warning getting me entity: {e}")
     CUSTOM_CROSS_MSG = load_custom_cross_msg()
-    print("✅ Devil Engine V7.0 SafeGuard connected & ready for commands.")
+    print("✅ Devil Engine V7.1 SafeGuard+ connected & ready.")
 
 @app.route('/')
 async def home():
     return jsonify({
         "status": "online",
-        "engine": "Devil Cross-Promotion Engine V7.0 SafeGuard",
+        "engine": "Devil Cross-Promotion Engine V7.1 SafeGuard+",
         "is_running": CROSS_LOOP_RUNNING,
         "round": CURRENT_ROUND,
         "active_queue": len(CHANNELS_QUEUE),
@@ -531,8 +555,7 @@ async def api_status():
             "channel_id": k,
             "title": v.get("title", "Unknown"),
             "total_joins": v.get("total_joins", 0),
-            "runs": v.get("runs", 0),
-            "history": v.get("time_history", [])
+            "runs": v.get("runs", 0)
         })
 
     return jsonify({
@@ -605,7 +628,7 @@ async def api_reset():
     return jsonify({"status": "success", "message": "Queue reset completed."})
 
 # ========================================================
-# 🤖 BOT COMMAND CONTROLLER (OPTIMIZED COMMAND HANDLER)
+# 🤖 BOT COMMAND CONTROLLER
 # ========================================================
 @client.on(events.NewMessage())
 async def controller(event):
@@ -628,9 +651,7 @@ async def controller(event):
     text = event.raw_text.strip()
     lower_text = text.lower()
 
-    # ============================================================
-    # 🆕 /CROSS MSG SET - Save custom reply text
-    # ============================================================
+    # 🆕 /CROSS MSG SET
     if lower_text.startswith("/cross msg set"):
         custom_text = text[len("/cross msg set"):].strip()
         if not custom_text:
@@ -648,18 +669,14 @@ async def controller(event):
         )
         return
 
-    # ============================================================
-    # 🆕 /CROSS MSG CLEAR - Remove custom reply text
-    # ============================================================
+    # 🆕 /CROSS MSG CLEAR
     if lower_text.startswith("/cross msg clear"):
         CUSTOM_CROSS_MSG = None
         save_custom_cross_msg(None)
         await event.reply("🗑️ **Custom Cross Message cleared!**")
         return
 
-    # ============================================================
-    # 🆕 /CROSS MSG SHOW - View current saved text
-    # ============================================================
+    # 🆕 /CROSS MSG SHOW
     if lower_text.startswith("/cross msg show"):
         if CUSTOM_CROSS_MSG:
             await event.reply(f"📝 **Current Custom Cross Message:**\n\n`{CUSTOM_CROSS_MSG[:500]}`")
@@ -729,7 +746,7 @@ async def controller(event):
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
             await event.reply(
-                f"🚀 **Devil Engine V7.0 Active.**\n"
+                f"🚀 **Devil Engine V7.1 Active.**\n"
                 f"• Target channels: {len(CHANNELS_QUEUE)}\n"
                 f"• Round: #1\n"
                 f"{timer_msg}"
@@ -765,18 +782,11 @@ async def controller(event):
 
         hot_list, cold_list = [], []
         for k, v in sorted_channels:
-            history = v.get("time_history", [])
-            time_log = ""
-            if history:
-                best_run = max(history, key=lambda x: x["joins"])
-                if best_run["joins"] > 0:
-                    time_log = f" (Peak: +{best_run['joins']} at {best_run['hour']})"
-
-            display_text = f"• {v['title']} +{v['total_joins']} joins{time_log}"
-            if v["total_joins"] > 2:
+            display_text = f"• {v.get('title', 'Unknown')} +{v.get('total_joins', 0)} joins ({v.get('runs', 0)} runs)"
+            if v.get("total_joins", 0) > 2:
                 hot_list.append(display_text)
             else:
-                cold_list.append(f"• {v['title']} {v['total_joins']} join")
+                cold_list.append(f"• {v.get('title', 'Unknown')} {v.get('total_joins', 0)} join")
 
         hot_display = "\n".join(hot_list) if hot_list else "No Hot Channels Yet."
         cold_display = "\n".join(cold_list) if cold_list else "No Cold Channels Yet."
@@ -784,7 +794,7 @@ async def controller(event):
         msg_status = f"✅ Set ({len(CUSTOM_CROSS_MSG)} chars)" if CUSTOM_CROSS_MSG else "❌ Not Set"
 
         status_text = (
-            f"📊 **DEVIL ENGINE V7.0 STATUS**\n\n"
+            f"📊 **DEVIL ENGINE V7.1 STATUS**\n\n"
             f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
             f"• Round: **#{CURRENT_ROUND}**\n"
             f"• Mode: **{status_tracker.get('timer_end', 'None')}**\n"
@@ -799,12 +809,12 @@ async def controller(event):
         )
         
         if len(status_text) > 4000:
-            status_text = status_text[:3950] + "\n\n... (Truncated due to Telegram message length limit)"
+            status_text = status_text[:3950] + "\n\n... (Truncated)"
 
         await event.reply(status_text)
 
 # ========================================================
-# ⚡ CORE AUTOMATION LOOP ENGINE (V7.0 ROUND-ROBIN SKIP LOGIC)
+# ⚡ CORE AUTOMATION LOOP ENGINE (V7.1 OPTIMIZED)
 # ========================================================
 async def run_cross_loop(source_msgs):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE, SKIPPED_QUEUE, LOOP_END_TIME, PERMANENT_BAD_CHANNELS, CURRENT_ROUND, CUSTOM_CROSS_MSG
@@ -822,22 +832,22 @@ async def run_cross_loop(source_msgs):
                 break
 
             # ============================================================
-            # 🔄 ROUND COMPLETE LOGIC
+            # 🔄 ROUND COMPLETE LOGIC — OPTIMIZED (no stuck state)
             # ============================================================
             if not CHANNELS_QUEUE:
                 if SKIPPED_QUEUE:
-                    print(f"🔄 Round #{CURRENT_ROUND} complete! Moving {len(SKIPPED_QUEUE)} skipped channels back to active...")
+                    print(f"🔄 Round #{CURRENT_ROUND} complete! Moving {len(SKIPPED_QUEUE)} skipped back to active...")
                     CHANNELS_QUEUE = list(SKIPPED_QUEUE)
                     SKIPPED_QUEUE = []
                     CURRENT_ROUND += 1
-                    status_tracker["total"] += len(CHANNELS_QUEUE)
+                    status_tracker["total"] = len(CHANNELS_QUEUE)
                     status_tracker["remaining"] = len(CHANNELS_QUEUE)
-                    status_tracker["current_channel"] = "New Round Starting..."
+                    status_tracker["current_channel"] = "Round Refresh"
                     save_queue_state(CHANNELS_QUEUE, SKIPPED_QUEUE)
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(5)
                     continue
                 else:
-                    print(f"🔄 All channels covered! Reloading folder '{FOLDER_TARGET_NAME}'...")
+                    print(f"🔄 All covered! Reloading folder '{FOLDER_TARGET_NAME}'...")
                     channels = await get_folder_channels_safely(FOLDER_TARGET_NAME)
                     if channels:
                         CHANNELS_QUEUE = [c for c in channels if c not in PERMANENT_BAD_CHANNELS]
@@ -845,29 +855,30 @@ async def run_cross_loop(source_msgs):
                         CURRENT_ROUND = 1
                         status_tracker["total"] = len(CHANNELS_QUEUE)
                         status_tracker["remaining"] = len(CHANNELS_QUEUE)
+                        status_tracker["current_channel"] = "Folder Reload"
                         save_queue_state(CHANNELS_QUEUE, SKIPPED_QUEUE)
-                        await asyncio.sleep(15)
+                        await asyncio.sleep(10)
                         continue
                     else:
-                        print("⚠️ Folder empty. Retrying scan in 30s...")
-                        await asyncio.sleep(30)
+                        # ⚡ FIX: stuck state se bachne ke liye — chota sleep with retry counter
+                        print("⚠️ Folder empty. Retry in 20s...")
+                        await asyncio.sleep(20)
                         continue
 
             if not CHANNELS_QUEUE:
+                await asyncio.sleep(3)
                 continue
 
             channel_id = CHANNELS_QUEUE[0]
             status_tracker["remaining"] = len(CHANNELS_QUEUE)
 
             def pop_active_channel():
-                """Cross complete hone par active se hataao (skipped mein NAHI)"""
                 global CHANNELS_QUEUE
                 if CHANNELS_QUEUE and CHANNELS_QUEUE[0] == channel_id:
                     CHANNELS_QUEUE.pop(0)
                     save_queue_state(CHANNELS_QUEUE, SKIPPED_QUEUE)
 
             def move_to_skipped():
-                """Link nahi mila → temporary skipped queue mein daalo"""
                 global CHANNELS_QUEUE, SKIPPED_QUEUE
                 if CHANNELS_QUEUE and CHANNELS_QUEUE[0] == channel_id:
                     CHANNELS_QUEUE.pop(0)
@@ -917,32 +928,29 @@ async def run_cross_loop(source_msgs):
             except Exception:
                 pass
 
-            # 🎯 Returns: status ('SAFE_LINK' | 'BIO_FALLBACK' | 'SKIP'), link_or_bio_text
             verify_status, target_link = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
 
             # ============================================================
-            # 🎯 SKIP (blacklist word / sticker emoji / kuch nahi mila)
+            # 🎯 SKIP
             # ============================================================
             if verify_status == 'SKIP':
-                print(f"⏭️ Skipped: {ch_title} (blacklist/no-link sticker/no data) → Skipped Queue")
+                print(f"⏭️ Skipped: {ch_title} → Skipped Queue")
                 status_tracker["skipped"] += 1
                 move_to_skipped()
                 continue
 
             # ============================================================
-            # 📝 BIO_FALLBACK: Link nahi mila, but bio text hai → bio copy karo
+            # 📝 BIO_FALLBACK
             # ============================================================
             if verify_status == 'BIO_FALLBACK':
-                print(f"📝 Bio Fallback: {ch_title} (no link, copying bio) → Main Channel")
+                print(f"📝 Bio Fallback: {ch_title} → Main Channel")
                 
                 fwd_ids = []
                 first_fwd_id = None
 
-                # Pehle cross channel me source post forward karo (reply setup)
                 if source_msgs:
                     fwd_msgs = await safe_api_call(client.forward_messages, real_entity, source_msgs[0], silent=False)
                     if fwd_msgs == "PERMISSION_ERROR":
-                        print(f"🚫 Permission error for {ch_title}. Permanently skipping.")
                         PERMANENT_BAD_CHANNELS.add(channel_id)
                         status_tracker["skipped"] += 1
                         pop_active_channel()
@@ -955,12 +963,10 @@ async def run_cross_loop(source_msgs):
 
                 main_channel_msg_ids = []
 
-                # Bio text ko main channel me send karo + 🆕 Custom Msg Reply
                 drop = await safe_api_call(client.send_message, TARGET_MAIN_CHANNEL, target_link, silent=True)
                 if drop and hasattr(drop, 'id'):
                     main_channel_msg_ids.append(drop.id)
 
-                    # 🆕 CUSTOM MSG REPLY FEATURE
                     if CUSTOM_CROSS_MSG:
                         reply_to_id = getattr(drop, 'id', None)
                         custom_reply = await safe_api_call(
@@ -973,7 +979,6 @@ async def run_cross_loop(source_msgs):
                         if custom_reply and hasattr(custom_reply, 'id'):
                             main_channel_msg_ids.append(custom_reply.id)
 
-                # Secondary messages cross channel me bhejo (agar hai)
                 stop_secondary_flag = asyncio.Event()
 
                 async def send_secondary_posts_task_bio():
@@ -1019,7 +1024,6 @@ async def run_cross_loop(source_msgs):
                 stop_secondary_flag.set()
                 sec_task.cancel()
 
-                # Cleanup
                 if main_channel_msg_ids:
                     await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, main_channel_msg_ids)
                     main_channel_msg_ids.clear()
@@ -1034,7 +1038,7 @@ async def run_cross_loop(source_msgs):
                 continue
 
             # ============================================================
-            # ✅ SAFE_LINK: Normal cross process (link mila)
+            # ✅ SAFE_LINK — Normal cross
             # ============================================================
             fwd_ids = []
             first_fwd_id = None
@@ -1042,7 +1046,6 @@ async def run_cross_loop(source_msgs):
             if source_msgs:
                 fwd_msgs = await safe_api_call(client.forward_messages, real_entity, source_msgs[0], silent=False)
                 if fwd_msgs == "PERMISSION_ERROR":
-                    print(f"🚫 Permission error for {ch_title}. Permanently skipping channel.")
                     PERMANENT_BAD_CHANNELS.add(channel_id)
                     status_tracker["skipped"] += 1
                     pop_active_channel()
@@ -1060,6 +1063,7 @@ async def run_cross_loop(source_msgs):
 
             main_channel_msg_ids = []
 
+            # 🎯 Join count: BEFORE
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             await asyncio.sleep(random.uniform(1.5, 3.5))
 
@@ -1069,7 +1073,6 @@ async def run_cross_loop(source_msgs):
                 if drop and hasattr(drop, 'id'):
                     main_channel_msg_ids.append(drop.id)
 
-                    # 🆕 CUSTOM MSG REPLY FEATURE
                     if CUSTOM_CROSS_MSG:
                         reply_to_id = getattr(drop, 'id', None)
                         custom_reply = await safe_api_call(
@@ -1135,6 +1138,7 @@ async def run_cross_loop(source_msgs):
             stop_secondary_flag.set()
             sec_task.cancel()
 
+            # 🎯 Join count: AFTER (accurate)
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             if before_joins is not None and after_joins is not None:
                 joins_gained = max(0, after_joins - before_joins)
@@ -1168,7 +1172,7 @@ async def main():
     if me:
         ME_ID = me.id
     CUSTOM_CROSS_MSG = load_custom_cross_msg()
-    print("✅ Devil Cross Engine V7.0 SafeGuard online & operational.")
+    print("✅ Devil Cross Engine V7.1 SafeGuard+ online.")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
