@@ -18,7 +18,6 @@ from quart import Quart, jsonify, request
 # ========================================================
 # 🚀 TIMEZONE CONFIGURATION (NPT / NEPAL TIME)
 # ========================================================
-# Nepal Time: UTC + 5:45
 LOCAL_TZ = timezone(timedelta(hours=5, minutes=45))
 
 def get_local_now():
@@ -51,14 +50,13 @@ if 'client' not in globals() or client is None:
 CROSS_LOOP_RUNNING = False
 LOOP_END_TIME = None  
 MEMORY_CACHE = {}
-CHANNELS_QUEUE = []           # Active queue (cross karne wale)
-SKIPPED_QUEUE = []            # Temporary skipped (link nahi mila)
+CHANNELS_QUEUE = []
+SKIPPED_QUEUE = []
 PERMANENT_BAD_CHANNELS = set()
 CURRENT_SOURCE_MSGS = []
 ME_ID = None
-CURRENT_ROUND = 1             # Round counter
+CURRENT_ROUND = 1
 
-# 🆕 CROSS MSG SET feature: saved reply text
 CUSTOM_CROSS_MSG = None
 
 status_tracker = {
@@ -68,10 +66,9 @@ status_tracker = {
 LINK_RESOLVE_CACHE = {}
 
 # ========================================================
-# 🛡️ AUTOMATION SAFE API WRAPPER (UPGRADED FLOODWAIT)
+# 🛡️ AUTOMATION SAFE API WRAPPER
 # ========================================================
 async def safe_api_call(coro_func, *args, retries=3, **kwargs):
-    """Executes API calls safely with limited FloodWait retries & permission handling."""
     attempt = 0
     while attempt < retries:
         try:
@@ -133,7 +130,6 @@ def get_saved_skipped_queue():
     db = load_analytics()
     return db.get("saved_skipped_queue", [])
 
-# 🆕 Save / Load Custom Cross Message
 def save_custom_cross_msg(text):
     db = load_analytics()
     db["custom_cross_msg"] = text
@@ -143,7 +139,6 @@ def load_custom_cross_msg():
     db = load_analytics()
     return db.get("custom_cross_msg", None)
 
-# 🆕 UPDATED: Only count joins (no time history)
 def update_joins_score(channel_id, channel_title, joins_gained):
     db = load_analytics()
     ch_key = str(channel_id)
@@ -153,11 +148,10 @@ def update_joins_score(channel_id, channel_title, joins_gained):
 
     db[ch_key]["runs"] += 1
     db[ch_key]["total_joins"] += max(0, joins_gained)
-    # ✅ Time history REMOVED — sirf total count rakha
     save_analytics(db)
 
 # ========================================================
-# 📊 ANALYTICS IMPROVEMENT (SAFE JOIN REQUEST DETECTOR)
+# 📊 JOIN REQUEST DETECTOR
 # ========================================================
 async def get_current_join_requests(target_channel):
     try:
@@ -170,7 +164,7 @@ async def get_current_join_requests(target_channel):
     return None
 
 # ========================================================
-# 🔗 LINK DETECTOR & SAFE RESOLVER ENGINE
+# 🔗 LINK DETECTOR ENGINE
 # ========================================================
 def clean_and_repair_url(url):
     if not url:
@@ -289,20 +283,17 @@ async def safe_resolve_entity_id(link):
     return resolved_id
 
 # ========================================================
-# 🚫 ADVANCED NO-LINK DETECTOR (TEXT + STICKER + EMOJI)
+# 🚫 ADVANCED NO-LINK DETECTOR
 # ========================================================
 BLACKLIST_PHRASES = [
-    # English
     "no link", "no links", "no cross", "no promo", "no promotion",
     "admin remove", "cross off", "link not allowed", "links not allowed",
     "don't cross", "dont cross", "not allowed", "no advertising",
     "no ads", "no advert", "no ad", "no join", "no join link",
     "stop cross", "stop link", "no marketing", "no spam",
-    # Hindi / Hinglish
     "link nahi", "link nhi", "no link hai", "cross nahi", "cross nhi",
     "promo nahi", "promo nhi", "link band", "cross band",
     "link mat", "cross mat", "link mt", "cross mt",
-    # Visual / ASCII variants
     "🚫 no link", "❌ no link", "⛔ no link", "no 🚫", "no ❌",
     "link 🚫", "link ❌", "cross 🚫", "cross ❌",
 ]
@@ -359,21 +350,12 @@ def detect_no_link_from_sticker(msg):
     return False
 
 # ========================================================
-# 🔥 IMPROVED LINK VERIFICATION (STRICT OWN-LINK CHECK)
+# 🔥 STRICT LINK VERIFICATION
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
-    """Returns: (status, link_or_bio)
-    STRICT: Sirf usi channel ka apna link allow hoga. 
-    Agar kisi aur channel ka link mila → SKIP.
-    
-    status = 'SAFE_LINK' → apna link mila
-    status = 'BIO_FALLBACK' → link nahi mila, but bio text hai
-    status = 'SKIP' → blacklist / dusre ka link / kuch nahi mila
-    """
     current_channel_id = abs(current_channel_entity.id)
     current_username = (getattr(current_channel_entity, 'username', '') or '').lower().strip()
 
-    # 🚫 Step 1: No-Link detection (text + sticker + emoji)
     for msg in messages_list:
         raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
         
@@ -392,7 +374,6 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
                     print(f"🚫 No-link EMOJI caption detected: '{stripped}'")
                     return 'SKIP', None
 
-    # 🔗 Step 2: Collect all candidate links
     candidate_links = []
     for msg in messages_list:
         candidate_links.extend(get_all_links_from_msg(msg))
@@ -405,43 +386,35 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
             seen_tokens.add(tok)
             unique_candidate_links.append(clean_and_repair_url(l))
 
-    # 🎯 Step 3: STRICT — check each link's resolved ID
     own_link_found = None
     foreign_link_found = False
 
     for raw_link in unique_candidate_links:
         link_token = extract_link_token(raw_link)
         
-        # Quick username match (fast path)
         if current_username and link_token == current_username:
             own_link_found = raw_link
             break
         
-        # Resolve and compare IDs
         resolved_id = await safe_resolve_entity_id(raw_link)
         
         if resolved_id == 'UNKNOWN':
-            # Can't resolve — skip this link, but don't fail yet
             continue
         
         if resolved_id == current_channel_id:
             own_link_found = raw_link
             break
         else:
-            # 🚨 FOREIGN LINK DETECTED — yahi cross ghalat karta tha
-            print(f"🚨 Foreign link detected: {raw_link} (belongs to {resolved_id}, not {current_channel_id})")
+            print(f"🚨 Foreign link detected: {raw_link}")
             foreign_link_found = True
     
-    # ✅ Own link mila toh SAFE
     if own_link_found:
         return 'SAFE_LINK', own_link_found
     
-    # 🚫 Foreign link mila but apna nahi → SKIP
     if foreign_link_found:
-        print(f"🚫 Skipping {getattr(current_channel_entity, 'title', 'channel')}: only foreign links found")
+        print(f"🚫 Skipping: only foreign links found")
         return 'SKIP', None
 
-    # 📝 Step 4: Bio fallback check
     if bio_text:
         dummy_msg = type('DummyMsg', (), {'raw_text': bio_text, 'message': bio_text, 'reply_markup': None, 'entities': None})()
         bio_links = get_all_links_from_msg(dummy_msg)
@@ -454,22 +427,19 @@ async def verify_and_extract_links(current_channel_entity, messages_list, bio_te
             if resolved_id == current_channel_id:
                 return 'SAFE_LINK', clean_and_repair_url(link)
             elif resolved_id != 'UNKNOWN':
-                # Bio me bhi foreign link → SKIP
                 print(f"🚫 Bio has foreign link only → SKIP")
                 return 'SKIP', None
 
-    # 🎯 Step 5: Username fallback (agar channel ka username hai)
     if current_username:
         return 'SAFE_LINK', f"https://t.me/{current_username}"
 
-    # 📝 Step 6: Bio text fallback
     if bio_text and len(bio_text.strip()) > 0:
         return 'BIO_FALLBACK', bio_text.strip()
 
     return 'SKIP', None
 
 # ========================================================
-# 📁 FOLDER CHANNELS SCANNER (ROBUST FULL EXTRACTOR)
+# 📁 FOLDER CHANNELS SCANNER
 # ========================================================
 async def get_folder_channels_safely(target_name):
     channel_ids = []
@@ -516,7 +486,7 @@ def parse_duration(text_args):
     return val * 3600
 
 # ========================================================
-# 🌐 WEB REST API ENDPOINTS & LIFECYCLE HOOKS
+# 🌐 WEB REST API ENDPOINTS
 # ========================================================
 @app.before_serving
 async def startup_client():
@@ -628,7 +598,7 @@ async def api_reset():
     return jsonify({"status": "success", "message": "Queue reset completed."})
 
 # ========================================================
-# 🤖 BOT COMMAND CONTROLLER
+# 🤖 BOT COMMAND CONTROLLER (FULLY FIXED)
 # ========================================================
 @client.on(events.NewMessage())
 async def controller(event):
@@ -642,7 +612,9 @@ async def controller(event):
         except Exception:
             pass
 
-    if ME_ID and event.sender_id != ME_ID and not event.out:
+    # ✅ FIXED FILTER: Sirf self-sent messages (outgoing) allow karo
+    # Yani jo bhi message aap (logged-in account) se ja raha ho
+    if not event.out:
         return
 
     if not event.raw_text:
@@ -651,7 +623,11 @@ async def controller(event):
     text = event.raw_text.strip()
     lower_text = text.lower()
 
-    # 🆕 /CROSS MSG SET
+    print(f"📨 Command received: {text[:60]}")
+
+    # ============================================================
+    # 🆕 /CROSS MSG COMMANDS (checked first — most specific)
+    # ============================================================
     if lower_text.startswith("/cross msg set"):
         custom_text = text[len("/cross msg set"):].strip()
         if not custom_text:
@@ -669,14 +645,12 @@ async def controller(event):
         )
         return
 
-    # 🆕 /CROSS MSG CLEAR
     if lower_text.startswith("/cross msg clear"):
         CUSTOM_CROSS_MSG = None
         save_custom_cross_msg(None)
         await event.reply("🗑️ **Custom Cross Message cleared!**")
         return
 
-    # 🆕 /CROSS MSG SHOW
     if lower_text.startswith("/cross msg show"):
         if CUSTOM_CROSS_MSG:
             await event.reply(f"📝 **Current Custom Cross Message:**\n\n`{CUSTOM_CROSS_MSG[:500]}`")
@@ -684,6 +658,9 @@ async def controller(event):
             await event.reply("⚠️ **No custom cross message set.**\nUse: `/cross msg set <text>`")
         return
 
+    # ============================================================
+    # 🎯 MAIN CROSS COMMANDS
+    # ============================================================
     if lower_text.startswith("/cross start"):
         if not event.is_reply:
             await event.reply("⚠️ Reply to a post to set promo messages!")
@@ -692,7 +669,7 @@ async def controller(event):
             await event.reply("⚠️ Loop is already running!")
             return
 
-        duration_args = text[12:].strip()
+        duration_args = text[len("/cross start"):].strip()
         duration_sec = parse_duration(duration_args)
 
         if duration_sec:
@@ -753,8 +730,9 @@ async def controller(event):
             )
 
         asyncio.create_task(run_cross_loop(source_msgs))
+        return
 
-    elif lower_text.startswith("/cross stop"):
+    if lower_text.startswith("/cross stop"):
         CROSS_LOOP_RUNNING = False
         LOOP_END_TIME = None
         save_queue_state(CHANNELS_QUEUE, SKIPPED_QUEUE)
@@ -763,8 +741,9 @@ async def controller(event):
             f"• Active: {len(CHANNELS_QUEUE)}\n"
             f"• Skipped: {len(SKIPPED_QUEUE)}"
         )
+        return
 
-    elif lower_text.startswith("/cross reset"):
+    if lower_text.startswith("/cross reset"):
         save_queue_state([], [])
         CHANNELS_QUEUE = []
         SKIPPED_QUEUE = []
@@ -774,8 +753,9 @@ async def controller(event):
         CURRENT_ROUND = 1
         status_tracker.update({"total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None", "timer_end": "None"})
         await event.reply("🔄 **Queue, Skipped list & Bad channels reset completed!**")
+        return
 
-    elif lower_text.startswith("/status"):
+    if lower_text.startswith("/status"):
         db = load_analytics()
         sorted_channels = [item for item in db.items() if item[0] not in ("saved_queue_state", "saved_skipped_queue", "custom_cross_msg")]
         sorted_channels = sorted(sorted_channels, key=lambda x: x[1].get("total_joins", 0), reverse=True)
@@ -812,6 +792,7 @@ async def controller(event):
             status_text = status_text[:3950] + "\n\n... (Truncated)"
 
         await event.reply(status_text)
+        return
 
 # ========================================================
 # ⚡ CORE AUTOMATION LOOP ENGINE (V7.1 OPTIMIZED)
@@ -823,7 +804,6 @@ async def run_cross_loop(source_msgs):
 
     while CROSS_LOOP_RUNNING:
         try:
-            # ⏱️ Timer check
             if LOOP_END_TIME and get_local_now() >= LOOP_END_TIME:
                 print("⏱️ Set duration expired! Stopping cross engine cleanly.")
                 CROSS_LOOP_RUNNING = False
@@ -831,9 +811,6 @@ async def run_cross_loop(source_msgs):
                 save_queue_state(CHANNELS_QUEUE, SKIPPED_QUEUE)
                 break
 
-            # ============================================================
-            # 🔄 ROUND COMPLETE LOGIC — OPTIMIZED (no stuck state)
-            # ============================================================
             if not CHANNELS_QUEUE:
                 if SKIPPED_QUEUE:
                     print(f"🔄 Round #{CURRENT_ROUND} complete! Moving {len(SKIPPED_QUEUE)} skipped back to active...")
@@ -860,7 +837,6 @@ async def run_cross_loop(source_msgs):
                         await asyncio.sleep(10)
                         continue
                     else:
-                        # ⚡ FIX: stuck state se bachne ke liye — chota sleep with retry counter
                         print("⚠️ Folder empty. Retry in 20s...")
                         await asyncio.sleep(20)
                         continue
@@ -886,7 +862,6 @@ async def run_cross_loop(source_msgs):
                         SKIPPED_QUEUE.append(channel_id)
                     save_queue_state(CHANNELS_QUEUE, SKIPPED_QUEUE)
 
-            # Permanent bad check
             if channel_id in PERMANENT_BAD_CHANNELS:
                 pop_active_channel()
                 continue
@@ -907,7 +882,6 @@ async def run_cross_loop(source_msgs):
             ch_title = getattr(real_entity, 'title', 'Channel')
             status_tracker["current_channel"] = ch_title
 
-            # Scan messages
             messages_to_scan = []
             try:
                 async for last_msg in client.iter_messages(real_entity, limit=4):
@@ -930,18 +904,12 @@ async def run_cross_loop(source_msgs):
 
             verify_status, target_link = await verify_and_extract_links(real_entity, messages_to_scan, bio_text=bio)
 
-            # ============================================================
-            # 🎯 SKIP
-            # ============================================================
             if verify_status == 'SKIP':
                 print(f"⏭️ Skipped: {ch_title} → Skipped Queue")
                 status_tracker["skipped"] += 1
                 move_to_skipped()
                 continue
 
-            # ============================================================
-            # 📝 BIO_FALLBACK
-            # ============================================================
             if verify_status == 'BIO_FALLBACK':
                 print(f"📝 Bio Fallback: {ch_title} → Main Channel")
                 
@@ -1037,9 +1005,6 @@ async def run_cross_loop(source_msgs):
                 await asyncio.sleep(random.randint(5, 10))
                 continue
 
-            # ============================================================
-            # ✅ SAFE_LINK — Normal cross
-            # ============================================================
             fwd_ids = []
             first_fwd_id = None
 
@@ -1063,7 +1028,6 @@ async def run_cross_loop(source_msgs):
 
             main_channel_msg_ids = []
 
-            # 🎯 Join count: BEFORE
             before_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             await asyncio.sleep(random.uniform(1.5, 3.5))
 
@@ -1138,7 +1102,6 @@ async def run_cross_loop(source_msgs):
             stop_secondary_flag.set()
             sec_task.cancel()
 
-            # 🎯 Join count: AFTER (accurate)
             after_joins = await get_current_join_requests(TARGET_MAIN_CHANNEL)
             if before_joins is not None and after_joins is not None:
                 joins_gained = max(0, after_joins - before_joins)
