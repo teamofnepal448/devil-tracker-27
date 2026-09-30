@@ -25,7 +25,7 @@ def get_local_now():
     return datetime.now(LOCAL_TZ)
 
 # ========================================================
-# 🚀 QUART WEB APP INITIALIZATION (FOR HOSTING/RENDER)
+# 🚀 QUART WEB APP INITIALIZATION
 # ========================================================
 app = Quart("devil_cross_app", root_path=".")
 
@@ -66,8 +66,11 @@ status_tracker = {
 
 LINK_RESOLVE_CACHE = {}
 
-# 🆕 Join Tracking — persistent unique IDs
-GLOBAL_SEEN_MEMBER_IDS = set()  # Har woh ID jo kabhi new member ke roop me count hui
+# ========================================================
+# 🎯 JOIN TRACKING — Persistent Member IDs
+# ========================================================
+MAIN_CHANNEL_BASELINE_IDS = set()
+GLOBAL_SEEN_MEMBER_IDS = set()
 
 # ========================================================
 # 🛡️ AUTOMATION SAFE API WRAPPER
@@ -93,7 +96,7 @@ async def safe_api_call(coro_func, *args, retries=3, **kwargs):
     return None
 
 # ========================================================
-# 💾 STORAGE & ANALYTICS PERSISTENCE ENGINE
+# 💾 STORAGE & ANALYTICS
 # ========================================================
 def load_analytics():
     global MEMORY_CACHE
@@ -143,35 +146,20 @@ def load_custom_cross_msg():
     db = load_analytics()
     return db.get("custom_cross_msg", None)
 
-# 🆕 Persistent Global Seen Members (idempotent across restarts)
-def load_global_seen_members():
-    global GLOBAL_SEEN_MEMBER_IDS
+def load_persistent_state():
+    global GLOBAL_SEEN_MEMBER_IDS, MAIN_CHANNEL_BASELINE_IDS
     db = load_analytics()
-    stored = db.get("global_seen_member_ids", [])
-    GLOBAL_SEEN_MEMBER_IDS = set(stored)
-    return GLOBAL_SEEN_MEMBER_IDS
+    GLOBAL_SEEN_MEMBER_IDS = set(db.get("global_seen_member_ids", []))
+    MAIN_CHANNEL_BASELINE_IDS = set(db.get("main_channel_baseline_ids", []))
+    print(f"📊 Loaded: {len(MAIN_CHANNEL_BASELINE_IDS)} baseline IDs, {len(GLOBAL_SEEN_MEMBER_IDS)} seen IDs")
 
-def save_global_seen_members():
+def save_persistent_state():
     db = load_analytics()
     db["global_seen_member_ids"] = list(GLOBAL_SEEN_MEMBER_IDS)
+    db["main_channel_baseline_ids"] = list(MAIN_CHANNEL_BASELINE_IDS)
     save_analytics(db)
 
-# 🆕 Channel-wise persistent seen-member IDs map
-def load_channel_seen_ids():
-    db = load_analytics()
-    return db.get("channel_seen_member_ids", {})
-
-def save_channel_seen_ids(ch_map):
-    db = load_analytics()
-    db["channel_seen_member_ids"] = ch_map
-    save_analytics(db)
-
-# 🆕 UPDATED: Accurate join counting with unique ID tracking
 def update_joins_score(channel_id, channel_title, new_unique_ids):
-    """
-    new_unique_ids: set of Telegram user IDs that are genuinely NEW
-    (not seen before anywhere in any channel)
-    """
     db = load_analytics()
     ch_key = str(channel_id)
 
@@ -181,7 +169,6 @@ def update_joins_score(channel_id, channel_title, new_unique_ids):
     if "unique_member_ids" not in db[ch_key]:
         db[ch_key]["unique_member_ids"] = []
 
-    # Ensure no duplicates at DB level
     existing_ids = set(db[ch_key]["unique_member_ids"])
     genuinely_new = [uid for uid in new_unique_ids if uid not in existing_ids]
 
@@ -189,7 +176,6 @@ def update_joins_score(channel_id, channel_title, new_unique_ids):
     db[ch_key]["total_joins"] += len(genuinely_new)
     db[ch_key]["unique_member_ids"].extend(genuinely_new)
 
-    # Also update global seen set (persistent)
     global GLOBAL_SEEN_MEMBER_IDS
     GLOBAL_SEEN_MEMBER_IDS.update(genuinely_new)
     db["global_seen_member_ids"] = list(GLOBAL_SEEN_MEMBER_IDS)
@@ -198,13 +184,9 @@ def update_joins_score(channel_id, channel_title, new_unique_ids):
     return len(genuinely_new)
 
 # ========================================================
-# 📊 JOIN MEMBER FETCHER (ACCURATE)
+# 📊 ACCURATE MEMBER IDS FETCHER
 # ========================================================
-async def fetch_all_member_ids(target_channel, max_fetch=5000):
-    """
-    Fetch member IDs from channel. Returns set of user IDs.
-    Safe wrapper — works only if admin/has access.
-    """
+async def fetch_all_member_ids(target_channel, max_fetch=8000):
     member_ids = set()
     try:
         offset = 0
@@ -234,19 +216,17 @@ async def fetch_all_member_ids(target_channel, max_fetch=5000):
                     member_ids.add(user.id)
                     total_fetched += 1
 
-            # If we got fewer than limit, we've reached the end
             if len(participants.participants) < limit:
                 break
 
             offset += limit
-            await asyncio.sleep(0.5)  # Small delay to avoid flood
+            await asyncio.sleep(0.4)
 
     except Exception as e:
         print(f"⚠️ Member fetch error: {e}")
 
     return member_ids
 
-# Keep old function for backward-compat (used for join requests count display)
 async def get_current_join_requests(target_channel):
     try:
         full_channel = await safe_api_call(client, GetFullChannelRequest(target_channel))
@@ -256,6 +236,34 @@ async def get_current_join_requests(target_channel):
     except Exception as e:
         print(f"⚠️ Join request API check failed gracefully: {e}")
     return None
+
+# ========================================================
+# 🎯 ACCURATE JOIN COUNTER
+# ========================================================
+async def measure_new_joins(channel_id, ch_title):
+    global MAIN_CHANNEL_BASELINE_IDS, GLOBAL_SEEN_MEMBER_IDS
+
+    current_members = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
+
+    if not current_members:
+        print(f"⚠️ Could not fetch members for {ch_title}")
+        return set(), 0
+
+    raw_new = current_members - MAIN_CHANNEL_BASELINE_IDS
+    truly_new = raw_new - GLOBAL_SEEN_MEMBER_IDS
+
+    MAIN_CHANNEL_BASELINE_IDS = current_members
+
+    added = 0
+    if truly_new:
+        added = update_joins_score(channel_id, ch_title, list(truly_new))
+        print(f"✅ {ch_title}: {added} NEW unique joins (raw_new={len(raw_new)}, filtered={len(truly_new)})")
+    else:
+        update_joins_score(channel_id, ch_title, [])
+        print(f"⚪ {ch_title}: 0 new joins (raw_new={len(raw_new)})")
+
+    save_persistent_state()
+    return truly_new, added
 
 # ========================================================
 # 🔗 LINK DETECTOR ENGINE
@@ -444,6 +452,61 @@ def detect_no_link_from_sticker(msg):
     return False
 
 # ========================================================
+# 🧹 PROMO NOISE FILTER (MAIN CHANNEL DELETION)
+# ========================================================
+PROMO_NOISE_PATTERNS = [
+    r'^\s*r\s*[\.\-]?\s*rmv\s*$',
+    r'^\s*rmv\s*$',
+    r'^\s*next\s+link\s*$',
+    r'^\s*hai\s+mt\s+dalo\s+link\s*$',
+    r'^\s*hai\s+mat\s+dalo\s+link\s*$',
+    r'^\s*link\s*$',
+    r'^\s*\.\s*$',
+    r'^\s*\.\.\s*$',
+    r'^\s*\.\.\.\s*$',
+    r'^\s*promo\s+time\s*$',
+    r'^\s*toss\s+time\s*$',
+    r'^\s*chk\s+time\s*$',
+    r'^\s*check\s+time\s*$',
+    r'^\s*toss\s*$',
+    r'^\s*chk\s*$',
+    r'^\s*rmv\s+link\s*$',
+    r'^\s*remove\s*$',
+    r'^\s*remove\s+link\s*$',
+]
+
+PROMO_NOISE_EMOJI_SUBSTRINGS = ["🗑", "❌", "🚫", "⛔"]
+
+def is_promo_noise_message(msg):
+    if not msg:
+        return False
+
+    raw_text = getattr(msg, 'raw_text', '') or getattr(msg, 'message', '') or ''
+    if not raw_text:
+        return False
+
+    txt = raw_text.strip()
+    if not txt:
+        return False
+
+    lower = txt.lower()
+
+    for emo in PROMO_NOISE_EMOJI_SUBSTRINGS:
+        if emo in txt and len(txt) <= 4:
+            return True
+
+    for pattern in PROMO_NOISE_PATTERNS:
+        if re.match(pattern, lower):
+            return True
+
+    compact = re.sub(r'[\s\.\-_]', '', lower)
+    if compact in ("rrmv", "rmv", "nextlink", "haimtdalolink", "haimatdalolink",
+                   "promotime", "tosstime", "chktime", "checktime", "link", "remove"):
+        return True
+
+    return False
+
+# ========================================================
 # 🔥 STRICT LINK VERIFICATION
 # ========================================================
 async def verify_and_extract_links(current_channel_entity, messages_list, bio_text=""):
@@ -594,25 +657,26 @@ async def startup_client():
     except Exception as e:
         print(f"⚠️ Warning getting me entity: {e}")
     CUSTOM_CROSS_MSG = load_custom_cross_msg()
-    load_global_seen_members()
-    print("✅ Devil Engine V7.2 SafeGuard++ connected & ready.")
+    load_persistent_state()
+    print("✅ Devil Engine V7.4 SafeGuard++++ connected & ready.")
 
 @app.route('/')
 async def home():
     return jsonify({
         "status": "online",
-        "engine": "Devil Cross-Promotion Engine V7.2 SafeGuard++",
+        "engine": "Devil Cross-Promotion Engine V7.4",
         "is_running": CROSS_LOOP_RUNNING,
         "round": CURRENT_ROUND,
         "active_queue": len(CHANNELS_QUEUE),
         "skipped_queue": len(SKIPPED_QUEUE),
-        "total_unique_joins": len(GLOBAL_SEEN_MEMBER_IDS)
+        "total_unique_joins": len(GLOBAL_SEEN_MEMBER_IDS),
+        "baseline_members": len(MAIN_CHANNEL_BASELINE_IDS)
     })
 
 @app.route('/api/status', methods=['GET'])
 async def api_status():
     db = load_analytics()
-    sorted_channels = [item for item in db.items() if item[0] not in ("saved_queue_state", "saved_skipped_queue", "custom_cross_msg", "global_seen_member_ids", "channel_seen_member_ids")]
+    sorted_channels = [item for item in db.items() if item[0] not in ("saved_queue_state", "saved_skipped_queue", "custom_cross_msg", "global_seen_member_ids", "channel_seen_member_ids", "main_channel_baseline_ids")]
     sorted_channels = sorted(sorted_channels, key=lambda x: x[1].get("total_joins", 0), reverse=True)
 
     analytics_data = []
@@ -632,6 +696,7 @@ async def api_status():
         "active_queue_length": len(CHANNELS_QUEUE),
         "skipped_queue_length": len(SKIPPED_QUEUE),
         "total_unique_joins": len(GLOBAL_SEEN_MEMBER_IDS),
+        "baseline_members": len(MAIN_CHANNEL_BASELINE_IDS),
         "analytics": analytics_data
     })
 
@@ -701,6 +766,7 @@ async def api_reset():
 @client.on(events.NewMessage())
 async def controller(event):
     global CROSS_LOOP_RUNNING, CHANNELS_QUEUE, SKIPPED_QUEUE, CURRENT_SOURCE_MSGS, LOOP_END_TIME, PERMANENT_BAD_CHANNELS, ME_ID, CURRENT_ROUND, CUSTOM_CROSS_MSG
+    global MAIN_CHANNEL_BASELINE_IDS, GLOBAL_SEEN_MEMBER_IDS
     
     if ME_ID is None:
         try:
@@ -751,6 +817,21 @@ async def controller(event):
             await event.reply("⚠️ **No custom cross message set.**\nUse: `/cross msg set <text>`")
         return
 
+    if lower_text.startswith("/cross snapshot"):
+        await event.reply("📸 Fetching main channel members for baseline snapshot...")
+        current = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
+        if current:
+            MAIN_CHANNEL_BASELINE_IDS = current
+            save_persistent_state()
+            await event.reply(
+                f"✅ **Baseline Snapshot Saved!**\n"
+                f"• Total members captured: **{len(current)}**\n"
+                f"• Ab in members ko kabhi new count nahi kiya jayega."
+            )
+        else:
+            await event.reply("❌ Failed to fetch member list. Admin permissions check karo.")
+        return
+
     if lower_text.startswith("/cross start"):
         if not event.is_reply:
             await event.reply("⚠️ Reply to a post to set promo messages!")
@@ -788,6 +869,14 @@ async def controller(event):
 
         CURRENT_SOURCE_MSGS = source_msgs
 
+        if not MAIN_CHANNEL_BASELINE_IDS:
+            print("📸 Taking initial baseline snapshot...")
+            baseline = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
+            if baseline:
+                MAIN_CHANNEL_BASELINE_IDS = baseline
+                save_persistent_state()
+                print(f"✅ Baseline saved: {len(baseline)} members")
+
         saved_q = get_saved_queue_state()
         saved_skip = get_saved_skipped_queue()
         
@@ -799,6 +888,7 @@ async def controller(event):
                 f"• Active: {len(CHANNELS_QUEUE)}\n"
                 f"• Skipped: {len(SKIPPED_QUEUE)}\n"
                 f"• Round: #{CURRENT_ROUND}\n"
+                f"• Baseline: {len(MAIN_CHANNEL_BASELINE_IDS)} members\n"
                 f"{timer_msg}"
             )
         else:
@@ -813,9 +903,10 @@ async def controller(event):
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
             await event.reply(
-                f"🚀 **Devil Engine V7.2 Active.**\n"
+                f"🚀 **Devil Engine V7.4 Active.**\n"
                 f"• Target channels: {len(CHANNELS_QUEUE)}\n"
                 f"• Round: #1\n"
+                f"• Baseline: {len(MAIN_CHANNEL_BASELINE_IDS)} members\n"
                 f"{timer_msg}"
             )
 
@@ -845,18 +936,46 @@ async def controller(event):
         await event.reply("🔄 **Queue, Skipped list & Bad channels reset completed!**")
         return
 
+    if lower_text.startswith("/cross freshreset"):
+        save_queue_state([], [])
+        CHANNELS_QUEUE = []
+        SKIPPED_QUEUE = []
+        PERMANENT_BAD_CHANNELS.clear()
+        CROSS_LOOP_RUNNING = False
+        LOOP_END_TIME = None
+        CURRENT_ROUND = 1
+        
+        MAIN_CHANNEL_BASELINE_IDS.clear()
+        GLOBAL_SEEN_MEMBER_IDS.clear()
+        
+        db = load_analytics()
+        for key in list(db.keys()):
+            if key not in ("saved_queue_state", "saved_skipped_queue", "custom_cross_msg"):
+                del db[key]
+        save_analytics(db)
+        
+        status_tracker.update({"total": 0, "completed": 0, "skipped": 0, "remaining": 0, "current_channel": "None", "timer_end": "None"})
+        await event.reply(
+            "🔄 **FULL FRESH RESET DONE!**\n"
+            "• Queue cleared\n"
+            "• Analytics wiped\n"
+            "• Baseline cleared\n"
+            "• Seen IDs cleared\n\n"
+            "Next `/cross start` par naya baseline banega."
+        )
+        return
+
     if lower_text.startswith("/status"):
         db = load_analytics()
-        sorted_channels = [item for item in db.items() if item[0] not in ("saved_queue_state", "saved_skipped_queue", "custom_cross_msg", "global_seen_member_ids", "channel_seen_member_ids")]
+        sorted_channels = [item for item in db.items() if item[0] not in ("saved_queue_state", "saved_skipped_queue", "custom_cross_msg", "global_seen_member_ids", "channel_seen_member_ids", "main_channel_baseline_ids")]
         sorted_channels = sorted(sorted_channels, key=lambda x: x[1].get("total_joins", 0), reverse=True)
 
         hot_list, cold_list = [], []
         grand_total = 0
         for k, v in sorted_channels:
             ch_joins = v.get("total_joins", 0)
-            ch_unique = len(v.get("unique_member_ids", []))
             grand_total += ch_joins
-            display_text = f"• {v.get('title', 'Unknown')} +{ch_joins} unique joins ({v.get('runs', 0)} runs)"
+            display_text = f"• {v.get('title', 'Unknown')} +{ch_joins} joins ({v.get('runs', 0)} runs)"
             if ch_joins > 2:
                 hot_list.append(display_text)
             else:
@@ -868,7 +987,7 @@ async def controller(event):
         msg_status = f"✅ Set ({len(CUSTOM_CROSS_MSG)} chars)" if CUSTOM_CROSS_MSG else "❌ Not Set"
 
         status_text = (
-            f"📊 **DEVIL ENGINE V7.2 STATUS**\n\n"
+            f"📊 **DEVIL ENGINE V7.4 STATUS**\n\n"
             f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
             f"• Round: **#{CURRENT_ROUND}**\n"
             f"• Mode: **{status_tracker.get('timer_end', 'None')}**\n"
@@ -878,10 +997,11 @@ async def controller(event):
             f"• 🚫 Permanently Bad: {len(PERMANENT_BAD_CHANNELS)}\n"
             f"• 📋 Active Queue: {len(CHANNELS_QUEUE)}\n"
             f"• 🎯 Current: **{status_tracker['current_channel']}**\n\n"
-            f"🎯 **UNIQUE JOIN TRACKING**\n"
+            f"🎯 **ACCURATE JOIN TRACKING**\n"
             f"• Total Unique New Joins: **{grand_total}**\n"
             f"• Duplicate Users Counted: **0** ✅\n"
-            f"• Global Unique Member IDs: {len(GLOBAL_SEEN_MEMBER_IDS)}\n\n"
+            f"• Global Unique Member IDs: {len(GLOBAL_SEEN_MEMBER_IDS)}\n"
+            f"• Baseline Members: {len(MAIN_CHANNEL_BASELINE_IDS)}\n\n"
             f"🔥 **HOT ({len(hot_list)})**\n{hot_display}\n\n"
             f"❄️ **COLD ({len(cold_list)})**\n{cold_display}"
         )
@@ -893,10 +1013,103 @@ async def controller(event):
         return
 
 # ========================================================
+# 🧹 OWNER PROMO CLEANUP (MAIN CHANNEL ONLY)
+# ========================================================
+async def cleanup_owner_promo_main_channel(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids):
+    """
+    CLEANUP: MAIN CHANNEL me owner ke foreign promo + reply noise
+    
+    SAFE: Sirf recent window scan karta hai. Purani posts ko touch nahi karta.
+    
+    Deletes:
+    1. Owner's foreign promo link (jo CROSS B owner ne dala)
+    2. Owner ke reply msg (jo bot ke drop msg ko reply karte hain)
+    3. Promo noise messages (R.RMV, Next Link, Link, etc.)
+    """
+    deleted_main_ids = set()
+
+    try:
+        recent_main = []
+        try:
+            async for m in client.iter_messages(TARGET_MAIN_CHANNEL, limit=15):
+                recent_main.append(m)
+        except Exception as e:
+            print(f"⚠️ Main channel scan error: {e}")
+
+        # Skip set: bot's own drop + custom reply
+        skip_ids = set(main_channel_msg_ids or [])
+        if our_drop_msg_id:
+            skip_ids.add(our_drop_msg_id)
+        if our_custom_reply_id:
+            skip_ids.add(our_custom_reply_id)
+
+        for m in recent_main:
+            if not m:
+                continue
+            msg_id = getattr(m, 'id', None)
+            if not msg_id:
+                continue
+
+            # Skip bot's own messages
+            if msg_id in skip_ids:
+                continue
+            if getattr(m, 'out', False):
+                continue
+
+            raw_text = getattr(m, 'raw_text', '') or getattr(m, 'message', '') or ''
+            msg_links = get_all_links_from_msg(m)
+
+            # 1) Owner's foreign promo link (not our main channel link)
+            has_foreign_link = False
+            for link in msg_links:
+                resolved = await safe_resolve_entity_id(link)
+                if resolved != 'UNKNOWN' and resolved != abs(TARGET_MAIN_CHANNEL):
+                    has_foreign_link = True
+                    break
+
+            if has_foreign_link:
+                deleted_main_ids.add(msg_id)
+                print(f"🗑️ MAIN: Owner promo link: '{raw_text[:40]}' (id={msg_id})")
+                continue
+
+            # 2) Owner's reply to bot's drop message
+            reply_to = getattr(m, 'reply_to_msg_id', None)
+            if reply_to and our_drop_msg_id and reply_to == our_drop_msg_id:
+                deleted_main_ids.add(msg_id)
+                print(f"🗑️ MAIN: Owner reply to our drop: id={msg_id}")
+                continue
+
+            # 3) Promo noise messages (R.RMV, Next Link, etc.)
+            if is_promo_noise_message(m):
+                deleted_main_ids.add(msg_id)
+                print(f"🗑️ MAIN: Promo noise: '{raw_text[:40]}' (id={msg_id})")
+                continue
+
+            # 4) No-link sticker
+            if not raw_text and getattr(m, 'sticker', None):
+                if detect_no_link_from_sticker(m):
+                    deleted_main_ids.add(msg_id)
+                    print(f"🗑️ MAIN: No-link sticker (id={msg_id})")
+                    continue
+
+        if deleted_main_ids:
+            try:
+                await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, list(deleted_main_ids))
+                print(f"✅ Deleted {len(deleted_main_ids)} owner msgs from MAIN channel")
+            except Exception as e:
+                print(f"⚠️ Main delete error: {e}")
+
+    except Exception as e:
+        print(f"⚠️ cleanup_owner_promo_main_channel error: {e}")
+
+    return deleted_main_ids
+
+# ========================================================
 # ⚡ CORE AUTOMATION LOOP ENGINE
 # ========================================================
 async def run_cross_loop(source_msgs):
     global CROSS_LOOP_RUNNING, status_tracker, CHANNELS_QUEUE, SKIPPED_QUEUE, LOOP_END_TIME, PERMANENT_BAD_CHANNELS, CURRENT_ROUND, CUSTOM_CROSS_MSG
+    global MAIN_CHANNEL_BASELINE_IDS
 
     status_tracker.update({"total": len(CHANNELS_QUEUE), "remaining": len(CHANNELS_QUEUE)})
 
@@ -1008,6 +1221,9 @@ async def run_cross_loop(source_msgs):
                 move_to_skipped()
                 continue
 
+            # ============================================================
+            # 📝 BIO_FALLBACK
+            # ============================================================
             if verify_status == 'BIO_FALLBACK':
                 print(f"📝 Bio Fallback: {ch_title} → Main Channel")
                 
@@ -1028,12 +1244,12 @@ async def run_cross_loop(source_msgs):
                             fwd_ids.append(first_fwd_id)
 
                 main_channel_msg_ids = []
-
-                # 🎯 JOIN TRACKING: BEFORE
-                before_members = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
+                our_drop_msg_id = None
+                our_custom_reply_id = None
 
                 drop = await safe_api_call(client.send_message, TARGET_MAIN_CHANNEL, target_link, silent=True)
                 if drop and hasattr(drop, 'id'):
+                    our_drop_msg_id = drop.id
                     main_channel_msg_ids.append(drop.id)
 
                     if CUSTOM_CROSS_MSG:
@@ -1046,6 +1262,7 @@ async def run_cross_loop(source_msgs):
                             silent=True
                         )
                         if custom_reply and hasattr(custom_reply, 'id'):
+                            our_custom_reply_id = custom_reply.id
                             main_channel_msg_ids.append(custom_reply.id)
 
                 stop_secondary_flag = asyncio.Event()
@@ -1093,35 +1310,19 @@ async def run_cross_loop(source_msgs):
                 stop_secondary_flag.set()
                 sec_task.cancel()
 
-                # 🎯 JOIN TRACKING: AFTER (delayed double check)
-                await asyncio.sleep(5)  # small settle time
-                after_members_1 = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
+                # 🧹 CLEANUP: Owner promo in MAIN CHANNEL
+                await cleanup_owner_promo_main_channel(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids)
 
-                await asyncio.sleep(12)  # wait for manually accepted requests
-                after_members_2 = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
+                # 🎯 ACCURATE JOIN MEASUREMENT
+                await asyncio.sleep(8)
+                await measure_new_joins(channel_id, ch_title)
 
-                # Merge: get union of both post-checks
-                all_after = after_members_1 | after_members_2
-                new_ids = all_after - before_members
-
-                # Filter — only genuinely new (never seen before globally)
-                truly_new_ids = new_ids - GLOBAL_SEEN_MEMBER_IDS
-
-                if truly_new_ids:
-                    added = update_joins_score(channel_id, ch_title, list(truly_new_ids))
-                    print(f"✅ Bio Fallback — {ch_title}: {added} new unique joins")
-                else:
-                    update_joins_score(channel_id, ch_title, [])
-
-                # Save channel seen
-                ch_map = load_channel_seen_ids()
-                ch_map[str(channel_id)] = list(set(ch_map.get(str(channel_id), []) + list(new_ids)))
-                save_channel_seen_ids(ch_map)
-
+                # Delete our own drop msgs from main channel
                 if main_channel_msg_ids:
                     await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, main_channel_msg_ids)
                     main_channel_msg_ids.clear()
 
+                # Delete our forwarded post from cross channel
                 if fwd_ids:
                     await safe_api_call(client.delete_messages, real_entity, fwd_ids)
                     fwd_ids.clear()
@@ -1156,9 +1357,8 @@ async def run_cross_loop(source_msgs):
                 continue
 
             main_channel_msg_ids = []
-
-            # 🎯 JOIN TRACKING: BEFORE (accurate member list fetch)
-            before_members = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
+            our_drop_msg_id = None
+            our_custom_reply_id = None
 
             await asyncio.sleep(random.uniform(1.5, 3.5))
 
@@ -1166,6 +1366,7 @@ async def run_cross_loop(source_msgs):
                 drop_text = target_link if not target_link.startswith("http") else f"👉 {target_link}"
                 drop = await safe_api_call(client.send_message, TARGET_MAIN_CHANNEL, drop_text, silent=True)
                 if drop and hasattr(drop, 'id'):
+                    our_drop_msg_id = drop.id
                     main_channel_msg_ids.append(drop.id)
 
                     if CUSTOM_CROSS_MSG:
@@ -1178,6 +1379,7 @@ async def run_cross_loop(source_msgs):
                             silent=True
                         )
                         if custom_reply and hasattr(custom_reply, 'id'):
+                            our_custom_reply_id = custom_reply.id
                             main_channel_msg_ids.append(custom_reply.id)
 
             stop_secondary_flag = asyncio.Event()
@@ -1233,28 +1435,12 @@ async def run_cross_loop(source_msgs):
             stop_secondary_flag.set()
             sec_task.cancel()
 
-            # 🎯 JOIN TRACKING: AFTER (double check for accuracy)
-            await asyncio.sleep(5)
-            after_members_1 = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
+            # 🧹 CLEANUP: Owner promo in MAIN CHANNEL
+            await cleanup_owner_promo_main_channel(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids)
 
-            await asyncio.sleep(12)  # catch manually accepted requests
-            after_members_2 = await fetch_all_member_ids(TARGET_MAIN_CHANNEL)
-
-            all_after = after_members_1 | after_members_2
-            new_ids = all_after - before_members
-
-            # Filter — only genuinely new (never seen before globally)
-            truly_new_ids = new_ids - GLOBAL_SEEN_MEMBER_IDS
-
-            if truly_new_ids:
-                added = update_joins_score(channel_id, ch_title, list(truly_new_ids))
-                print(f"✅ {ch_title}: {added} new unique joins detected")
-            else:
-                update_joins_score(channel_id, ch_title, [])
-
-            ch_map = load_channel_seen_ids()
-            ch_map[str(channel_id)] = list(set(ch_map.get(str(channel_id), []) + list(new_ids)))
-            save_channel_seen_ids(ch_map)
+            # 🎯 ACCURATE JOIN MEASUREMENT
+            await asyncio.sleep(8)
+            await measure_new_joins(channel_id, ch_title)
 
             if main_channel_msg_ids:
                 await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, main_channel_msg_ids)
@@ -1274,7 +1460,7 @@ async def run_cross_loop(source_msgs):
             continue
 
 # ========================================================
-# 🚀 DEVIL ENGINE PANEL ENTRY POINT
+# 🚀 ENTRY POINT
 # ========================================================
 async def main():
     global ME_ID, CUSTOM_CROSS_MSG
@@ -1284,8 +1470,8 @@ async def main():
     if me:
         ME_ID = me.id
     CUSTOM_CROSS_MSG = load_custom_cross_msg()
-    load_global_seen_members()
-    print("✅ Devil Cross Engine V7.2 SafeGuard++ online.")
+    load_persistent_state()
+    print("✅ Devil Cross Engine V7.4 SafeGuard++++ online.")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
