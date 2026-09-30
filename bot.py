@@ -554,15 +554,15 @@ async def startup_client():
         if me:
             ME_ID = me.id
     except Exception as e:
-        print(f"⚠️️ Warning getting me entity: {e}")
+        print(f"⚠️ Warning getting me entity: {e}")
     CUSTOM_CROSS_MSG = load_custom_cross_msg()
-    print("✅ Devil Engine V7.8 SafeGuard+ connected & ready.")
+    print("✅ Devil Engine V7.7 SafeGuard+ connected & ready.")
 
 @app.route('/')
 async def home():
     return jsonify({
         "status": "online",
-        "engine": "Devil Cross-Promotion Engine V7.8",
+        "engine": "Devil Cross-Promotion Engine V7.7",
         "is_running": CROSS_LOOP_RUNNING,
         "round": CURRENT_ROUND,
         "active_queue": len(CHANNELS_QUEUE),
@@ -671,7 +671,7 @@ async def api_reset():
     return jsonify({"status": "success", "message": "Queue reset completed."})
 
 # ========================================================
-# 🤖 BOT COMMAND CONTROLLER
+# 🤖 BOT COMMAND CONTROLLER (FIXED)
 # ========================================================
 @client.on(events.NewMessage())
 async def controller(event):
@@ -696,6 +696,7 @@ async def controller(event):
 
     print(f"📨 Command received: {text[:60]}")
 
+    # 🆕 Robust reply helper — try reply, fallback to plain send
     async def safe_reply(msg_text):
         try:
             await client.send_message(event.chat_id, msg_text, reply_to=event.id)
@@ -709,6 +710,9 @@ async def controller(event):
                 print(f"❌ Fallback send failed: {e2}")
                 return False
 
+    # ============================================================
+    # 🆕 /cross msg set
+    # ============================================================
     if lower_text.startswith("/cross msg set"):
         custom_text = text[len("/cross msg set"):].strip()
         if not custom_text:
@@ -726,12 +730,18 @@ async def controller(event):
         )
         return
 
+    # ============================================================
+    # 🆕 /cross msg clear
+    # ============================================================
     if lower_text.startswith("/cross msg clear"):
         CUSTOM_CROSS_MSG = None
         save_custom_cross_msg(None)
         await safe_reply("🗑️ **Custom Cross Message cleared!**")
         return
 
+    # ============================================================
+    # 🆕 /cross msg show
+    # ============================================================
     if lower_text.startswith("/cross msg show"):
         if CUSTOM_CROSS_MSG:
             await safe_reply(f"📝 **Current Custom Cross Message:**\n\n`{CUSTOM_CROSS_MSG[:500]}`")
@@ -739,6 +749,9 @@ async def controller(event):
             await safe_reply("⚠️ **No custom cross message set.**\nUse: `/cross msg set <text>`")
         return
 
+    # ============================================================
+    # 🎯 /cross start
+    # ============================================================
     if lower_text.startswith("/cross start"):
         if not event.is_reply:
             await safe_reply("⚠️ Reply to a post to set promo messages!")
@@ -801,7 +814,7 @@ async def controller(event):
 
             status_tracker.update({"total": len(CHANNELS_QUEUE), "completed": 0, "skipped": 0, "remaining": len(CHANNELS_QUEUE), "current_channel": "None"})
             await safe_reply(
-                f"🚀 **Devil Engine V7.8 Active.**\n"
+                f"🚀 **Devil Engine V7.7 Active.**\n"
                 f"• Target channels: {len(CHANNELS_QUEUE)}\n"
                 f"• Round: #1\n"
                 f"{timer_msg}"
@@ -810,6 +823,9 @@ async def controller(event):
         asyncio.create_task(run_cross_loop(source_msgs))
         return
 
+    # ============================================================
+    # 🎯 /cross stop
+    # ============================================================
     if lower_text.startswith("/cross stop"):
         CROSS_LOOP_RUNNING = False
         LOOP_END_TIME = None
@@ -821,6 +837,9 @@ async def controller(event):
         )
         return
 
+    # ============================================================
+    # 🎯 /cross reset
+    # ============================================================
     if lower_text.startswith("/cross reset"):
         save_queue_state([], [])
         CHANNELS_QUEUE = []
@@ -833,6 +852,9 @@ async def controller(event):
         await safe_reply("🔄 **Queue, Skipped list & Bad channels reset completed!**")
         return
 
+    # ============================================================
+    # 🎯 /status — FULL REPORT (FIXED)
+    # ============================================================
     if lower_text.startswith("/status"):
         print("📊 Building status report...")
         
@@ -880,7 +902,7 @@ async def controller(event):
             msg_status = f"✅ Set ({len(CUSTOM_CROSS_MSG)} chars)" if CUSTOM_CROSS_MSG else "❌ Not Set"
 
             status_text = (
-                f"📊 **DEVIL ENGINE V7.8 STATUS**\n\n"
+                f"📊 **DEVIL ENGINE V7.7 STATUS**\n\n"
                 f"• Engine: {'⚡ RUNNING' if CROSS_LOOP_RUNNING else '💤 IDLE'}\n"
                 f"• Round: **#{CURRENT_ROUND}**\n"
                 f"• Mode: **{status_tracker.get('timer_end', 'None')}**\n"
@@ -913,20 +935,9 @@ async def controller(event):
         return
 
 # ========================================================
-# 🧹 SMART CLEANUP — Owner's all messages + bot's own drop
+# 🧹 SAFE OWNER PROMO CLEANUP (TIMESTAMP-BASED ONLY)
 # ========================================================
-async def cleanup_owner_and_own_msgs(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids, snapshot_before_id):
-    """
-    SMART CLEANUP:
-    
-    1. Bot ke apne messages (drop + custom reply) → DELETE
-    2. Owner ke SAARE messages jo cross window me aaye (snapshot ke baad) → DELETE
-       - Chahe link ho ya text
-       - Chahe reply ho ya attach ho
-       - Chahe "Join now" ho ya kuch aur
-    3. Purani posts → NEVER touch
-    4. Bot ka dala hua duplicate link (agar owner ne wahi link dubara dala) → DELETE (bot apna delete kare)
-    """
+async def cleanup_owner_promo_main_channel(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids, snapshot_before_id):
     deleted_main_ids = set()
 
     try:
@@ -936,7 +947,6 @@ async def cleanup_owner_and_own_msgs(our_drop_msg_id, our_custom_reply_id, main_
         if our_custom_reply_id:
             skip_ids.add(our_custom_reply_id)
 
-        # Scan messages after snapshot
         recent_main = []
         try:
             if snapshot_before_id:
@@ -944,12 +954,12 @@ async def cleanup_owner_and_own_msgs(our_drop_msg_id, our_custom_reply_id, main_
                     client.get_messages,
                     TARGET_MAIN_CHANNEL,
                     min_id=snapshot_before_id,
-                    limit=50
+                    limit=30
                 )
                 if not isinstance(recent_main, list):
                     recent_main = []
             else:
-                async for m in client.iter_messages(TARGET_MAIN_CHANNEL, limit=20):
+                async for m in client.iter_messages(TARGET_MAIN_CHANNEL, limit=15):
                     recent_main.append(m)
         except Exception as e:
             print(f"⚠️ Main channel scan error: {e}")
@@ -961,55 +971,39 @@ async def cleanup_owner_and_own_msgs(our_drop_msg_id, our_custom_reply_id, main_
             if not msg_id:
                 continue
 
-            # Skip our own drop/custom IDs (handled separately)
             if msg_id in skip_ids:
+                continue
+            if getattr(m, 'out', False):
                 continue
 
             raw_text = getattr(m, 'raw_text', '') or getattr(m, 'message', '') or ''
 
-            # Skip our own outgoing messages (bot ke bheje hue)
-            if getattr(m, 'out', False):
-                continue
-
-            # 🎯 RULE 1: Owner ke SAARE messages delete karo (jo cross window me aaye)
-            # Yani koi bhi non-bot message after snapshot_before_id
-            # (Link ho, text ho, reply ho, attach ho — sab delete)
-            
-            # Bot's own drop link ke reply me aaya koi bhi message → delete
             reply_to = getattr(m, 'reply_to_msg_id', None)
             if reply_to and our_drop_msg_id and reply_to == our_drop_msg_id:
                 deleted_main_ids.add(msg_id)
-                print(f"🗑️ MAIN: Owner reply to our drop: '{raw_text[:40]}' (id={msg_id})")
+                print(f"🗑️ MAIN: Owner reply to our drop: id={msg_id}")
                 continue
 
-            # Promo noise (R.RMV, Next Link, Link etc.)
             if is_promo_noise_message(m):
                 deleted_main_ids.add(msg_id)
                 print(f"🗑️ MAIN: Promo noise: '{raw_text[:40]}' (id={msg_id})")
                 continue
 
-            # No-link sticker
             if not raw_text and getattr(m, 'sticker', None):
                 if detect_no_link_from_sticker(m):
                     deleted_main_ids.add(msg_id)
                     print(f"🗑️ MAIN: No-link sticker (id={msg_id})")
                     continue
 
-            # 🎯 RULE 2: Owner ka koi bhi message (jo humne nahi bheja) → delete
-            # Kyunki ye cross window me aaya = owner's promo activity
-            deleted_main_ids.add(msg_id)
-            print(f"🗑️ MAIN: Owner activity cleanup: '{raw_text[:40]}' (id={msg_id})")
-
-        # Delete all collected IDs
         if deleted_main_ids:
             try:
                 await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, list(deleted_main_ids))
-                print(f"✅ Deleted {len(deleted_main_ids)} messages from MAIN channel")
+                print(f"✅ Deleted {len(deleted_main_ids)} owner msgs from MAIN channel")
             except Exception as e:
                 print(f"⚠️ Main delete error: {e}")
 
     except Exception as e:
-        print(f"⚠️ cleanup_owner_and_own_msgs error: {e}")
+        print(f"⚠️ cleanup_owner_promo_main_channel error: {e}")
 
     return deleted_main_ids
 
@@ -1228,8 +1222,7 @@ async def run_cross_loop(source_msgs):
                 stop_secondary_flag.set()
                 sec_task.cancel()
 
-                # 🧹 SMART CLEANUP — owner's all msgs + our own
-                await cleanup_owner_and_own_msgs(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids, snapshot_before_id)
+                await cleanup_owner_promo_main_channel(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids, snapshot_before_id)
 
                 after_joins = await get_join_request_count(TARGET_MAIN_CHANNEL)
                 if before_joins is not None and after_joins is not None:
@@ -1237,12 +1230,10 @@ async def run_cross_loop(source_msgs):
                     update_joins_score(channel_id, ch_title, joins_gained)
                     print(f"✅ {ch_title}: {joins_gained} new join requests")
 
-                # Delete our own drop msgs
                 if main_channel_msg_ids:
                     await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, main_channel_msg_ids)
                     main_channel_msg_ids.clear()
 
-                # Delete our forwarded post from cross channel
                 if fwd_ids:
                     await safe_api_call(client.delete_messages, real_entity, fwd_ids)
                     fwd_ids.clear()
@@ -1365,8 +1356,7 @@ async def run_cross_loop(source_msgs):
             stop_secondary_flag.set()
             sec_task.cancel()
 
-            # 🧹 SMART CLEANUP — owner's all msgs + our own
-            await cleanup_owner_and_own_msgs(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids, snapshot_before_id)
+            await cleanup_owner_promo_main_channel(our_drop_msg_id, our_custom_reply_id, main_channel_msg_ids, snapshot_before_id)
 
             after_joins = await get_join_request_count(TARGET_MAIN_CHANNEL)
             if before_joins is not None and after_joins is not None:
@@ -1374,7 +1364,6 @@ async def run_cross_loop(source_msgs):
                 update_joins_score(channel_id, ch_title, joins_gained)
                 print(f"✅ {ch_title}: {joins_gained} new join requests")
 
-            # Delete our own drop msgs (bot ka dala hua link)
             if main_channel_msg_ids:
                 await safe_api_call(client.delete_messages, TARGET_MAIN_CHANNEL, main_channel_msg_ids)
                 main_channel_msg_ids.clear()
@@ -1403,7 +1392,7 @@ async def main():
     if me:
         ME_ID = me.id
     CUSTOM_CROSS_MSG = load_custom_cross_msg()
-    print("✅ Devil Cross Engine V7.8 SafeGuard+ online.")
+    print("✅ Devil Cross Engine V7.7 SafeGuard+ online.")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
